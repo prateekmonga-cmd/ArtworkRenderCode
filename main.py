@@ -28,7 +28,7 @@ PAGE_CONFIG = {
 SKIP_PAGES = [4]
 
 # ─── Annotation detection ────────────────────────────────────
-ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8"}
+ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#196ea6"}
 DIMENSION_PATTERN = re.compile(r'^\s*[\d.]+\s*mm\s*$', re.IGNORECASE)
 ARROW_CHARS = {'◄', '►', '▲', '▼', '←', '→', '↑', '↓', '◀', '▶'}
 
@@ -410,7 +410,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
 
     rect = page.rect
     width_pt, height_pt = rect.width, rect.height
-    header_threshold = height_pt * 0.15
+    header_threshold = height_pt * 0.20
     is_insert = page_index in [2, 3]
 
     # 1. Paths first (zone detection needs them)
