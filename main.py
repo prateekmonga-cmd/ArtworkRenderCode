@@ -426,6 +426,21 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     for span in sections["body"]:
         span["zone"] = assign_span_to_zone(span["bbox"], zones)
 
+    # 4b. Column-aware re-sort: zone → X-column bucket (40pt ≈ 14mm) → Y → X
+    # Uses left edge (bbox[0]) NOT center X.
+    # Reason: narrow spans like "supra" (x=246–259, cx=252.5) would bucket
+    # differently from wider siblings also starting at x=246 (cx=261+) if we
+    # used center X. Left edge ensures all items starting at the same column
+    # margin land in the same bucket regardless of width.
+    def _col_sort_key(s, col_w_pt=40):
+        b = s["bbox"]
+        left_x = b[0]   # left edge — consistent column alignment
+        zone_id = s.get("zone") or "z_outside"
+        col_bucket = round(left_x / col_w_pt)
+        return (zone_id, col_bucket, b[1], b[0])
+
+    sections["body"].sort(key=_col_sort_key)
+
     # 5. Images
     images = extract_images(page, doc)
 
