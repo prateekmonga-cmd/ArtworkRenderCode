@@ -9,17 +9,10 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (needed for PyMuPDF + WeasyPrint)
+# Install system dependencies (needed for PyMuPDF)
 RUN apt-get update && apt-get install -y \
     build-essential \
     libgl1 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libgdk-pixbuf-2.0-0 \
-    libcairo2 \
-    libffi8 \
-    shared-mime-info \
-    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)

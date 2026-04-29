@@ -11,7 +11,7 @@ import io
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Any, Optional
-from weasyprint import HTML
+from xhtml2pdf import pisa
 
 app = FastAPI(
     title="Artwork Compliance Extractor",
@@ -563,9 +563,13 @@ async def html_to_pdf(request: Request):
         html_string = data.get("html", "")
         if not html_string:
             raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
-        pdf_bytes = HTML(string=html_string).write_pdf()
+        pdf_buffer = io.BytesIO()
+        pisa_status = pisa.CreatePDF(io.StringIO(html_string), dest=pdf_buffer)
+        if pisa_status.err:
+            raise HTTPException(status_code=500, detail="PDF rendering failed")
+        pdf_buffer.seek(0)
         return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+            pdf_buffer,
             media_type="application/pdf",
             headers={"Content-Disposition": "attachment; filename=compliance_report.pdf"},
         )
