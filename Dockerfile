@@ -9,10 +9,12 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (needed for PyMuPDF)
+# Install system dependencies (needed for PyMuPDF + pycairo)
 RUN apt-get update && apt-get install -y \
     build-essential \
     libgl1 \
+    pkg-config \
+    libcairo2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)
