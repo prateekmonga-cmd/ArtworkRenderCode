@@ -11,7 +11,12 @@ import io
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Any, Optional
-from xhtml2pdf import pisa
+from playwright.async_api import async_playwright
+
+# Global browser instance (reused across requests)
+_playwright = None
+_browser = None
+
 
 app = FastAPI(
     title="Artwork Compliance Extractor",
@@ -555,21 +560,36 @@ async def root():
     }
 
 
+@app.on_event("startup")
+async def startup_browser():
+    global _playwright, _browser
+    _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
+
+
+@app.on_event("shutdown")
+async def shutdown_browser():
+    global _playwright, _browser
+    if _browser:
+        await _browser.close()
+    if _playwright:
+        await _playwright.stop()
+
+
 @app.post("/html-to-pdf")
 async def html_to_pdf(request: Request):
-    """Convert HTML body to PDF and return binary stream."""
+    """Convert HTML body to PDF using headless Chromium."""
     try:
         data = await request.json()
         html_string = data.get("html", "")
         if not html_string:
             raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
-        pdf_buffer = io.BytesIO()
-        pisa_status = pisa.CreatePDF(io.StringIO(html_string), dest=pdf_buffer)
-        if pisa_status.err:
-            raise HTTPException(status_code=500, detail="PDF rendering failed")
-        pdf_buffer.seek(0)
+        page = await _browser.new_page()
+        await page.set_content(html_string, wait_until="networkidle")
+        pdf_bytes = await page.pdf(format="A4", print_background=True)
+        await page.close()
         return StreamingResponse(
-            pdf_buffer,
+            io.BytesIO(pdf_bytes),
             media_type="application/pdf",
             headers={"Content-Disposition": "attachment; filename=compliance_report.pdf"},
         )

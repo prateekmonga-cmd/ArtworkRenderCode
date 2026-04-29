@@ -9,12 +9,10 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (needed for PyMuPDF + pycairo)
+# Install system dependencies (needed for PyMuPDF)
 RUN apt-get update && apt-get install -y \
     build-essential \
     libgl1 \
-    pkg-config \
-    libcairo2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)
@@ -22,6 +20,9 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright Chromium + system deps
+RUN playwright install --with-deps chromium
 
 # Copy application code
 COPY . .
