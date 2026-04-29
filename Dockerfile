@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     fonts-liberation \
     fonts-unifont \
+    libxfixes3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)
