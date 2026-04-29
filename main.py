@@ -7,9 +7,11 @@ Enhanced: zone detection, rotation, ligature repair, annotation filtering.
 import fitz  # PyMuPDF
 import re
 import math
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+import io
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Any, Optional
+from weasyprint import HTML
 
 app = FastAPI(
     title="Artwork Compliance Extractor",
@@ -547,6 +549,27 @@ async def root():
         ],
         "endpoints": {
             "POST /extract": "Upload PDF and extract artwork data",
+            "POST /html-to-pdf": "Convert HTML string to PDF binary",
             "GET /health": "Health check",
         },
     }
+
+
+@app.post("/html-to-pdf")
+async def html_to_pdf(request: Request):
+    """Convert HTML body to PDF and return binary stream."""
+    try:
+        data = await request.json()
+        html_string = data.get("html", "")
+        if not html_string:
+            raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
+        pdf_bytes = HTML(string=html_string).write_pdf()
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=compliance_report.pdf"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
