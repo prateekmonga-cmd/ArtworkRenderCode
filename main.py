@@ -586,7 +586,11 @@ async def html_to_pdf(request: Request):
             raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
         page = await _browser.new_page()
         await page.set_content(html_string, wait_until="networkidle")
-        pdf_bytes = await page.pdf(format="A4", print_background=True)
+        pdf_bytes = await page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
+        )
         await page.close()
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
