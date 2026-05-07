@@ -7,9 +7,16 @@ Enhanced: zone detection, rotation, ligature repair, annotation filtering.
 import fitz  # PyMuPDF
 import re
 import math
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+import io
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from typing import Any, Optional
+from playwright.async_api import async_playwright
+
+# Global browser instance (reused across requests)
+_playwright = None
+_browser = None
+
 
 app = FastAPI(
     title="Artwork Compliance Extractor",
@@ -28,7 +35,7 @@ PAGE_CONFIG = {
 SKIP_PAGES = [4]
 
 # ─── Annotation detection ────────────────────────────────────
-ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8"}
+ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#196ea6"}
 DIMENSION_PATTERN = re.compile(r'^\s*[\d.]+\s*mm\s*$', re.IGNORECASE)
 ARROW_CHARS = {'◄', '►', '▲', '▼', '←', '→', '↑', '↓', '◀', '▶'}
 
@@ -410,7 +417,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
 
     rect = page.rect
     width_pt, height_pt = rect.width, rect.height
-    header_threshold = height_pt * 0.15
+    header_threshold = height_pt * 0.20
     is_insert = page_index in [2, 3]
 
     # 1. Paths first (zone detection needs them)
@@ -425,6 +432,21 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     # 4. Assign spans to zones
     for span in sections["body"]:
         span["zone"] = assign_span_to_zone(span["bbox"], zones)
+
+    # 4b. Column-aware re-sort: zone → X-column bucket (40pt ≈ 14mm) → Y → X
+    # Uses left edge (bbox[0]) NOT center X.
+    # Reason: narrow spans like "supra" (x=246–259, cx=252.5) would bucket
+    # differently from wider siblings also starting at x=246 (cx=261+) if we
+    # used center X. Left edge ensures all items starting at the same column
+    # margin land in the same bucket regardless of width.
+    def _col_sort_key(s, col_w_pt=40):
+        b = s["bbox"]
+        left_x = b[0]   # left edge — consistent column alignment
+        zone_id = s.get("zone") or "z_outside"
+        col_bucket = round(left_x / col_w_pt)
+        return (zone_id, col_bucket, b[1], b[0])
+
+    sections["body"].sort(key=_col_sort_key)
 
     # 5. Images
     images = extract_images(page, doc)
@@ -532,6 +554,50 @@ async def root():
         ],
         "endpoints": {
             "POST /extract": "Upload PDF and extract artwork data",
+            "POST /html-to-pdf": "Convert HTML string to PDF binary",
             "GET /health": "Health check",
         },
     }
+
+
+@app.on_event("startup")
+async def startup_browser():
+    global _playwright, _browser
+    _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
+
+
+@app.on_event("shutdown")
+async def shutdown_browser():
+    global _playwright, _browser
+    if _browser:
+        await _browser.close()
+    if _playwright:
+        await _playwright.stop()
+
+
+@app.post("/html-to-pdf")
+async def html_to_pdf(request: Request):
+    """Convert HTML body to PDF using headless Chromium."""
+    try:
+        data = await request.json()
+        html_string = data.get("html", "")
+        if not html_string:
+            raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
+        page = await _browser.new_page()
+        await page.set_content(html_string, wait_until="networkidle")
+        pdf_bytes = await page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
+        )
+        await page.close()
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=compliance_report.pdf"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
