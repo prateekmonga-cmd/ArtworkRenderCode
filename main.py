@@ -536,6 +536,116 @@ async def extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# GPMI TEXT EXTRACTION — matches DOCX extractor output format
+# Preserves superscript/subscript via font-size + position heuristic
+# ═══════════════════════════════════════════════════════════════
+
+def _extract_gpmi_page(page: fitz.Page) -> list:
+    """Extract paragraphs from a single PDF page with <sup>/<sub> tags."""
+    text_dict = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    paragraphs = []
+
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:  # text blocks only
+            continue
+
+        block_lines = []
+        for line in block.get("lines", []):
+            line_spans = []
+            for span in line.get("spans", []):
+                chars = span.get("chars", [])
+                if chars:
+                    raw_text = "".join(ch.get("c", "") for ch in chars)
+                else:
+                    raw_text = span.get("text", "")
+
+                if not raw_text:
+                    continue
+
+                repaired_text, _, _ = repair_text(raw_text)
+
+                line_spans.append({
+                    "text": repaired_text,
+                    "font_size": snap_size(span.get("size", 0)),
+                    "top_y": span.get("bbox", (0, 0, 0, 0))[1],
+                    "bot_y": span.get("bbox", (0, 0, 0, 0))[3],
+                })
+
+            if not line_spans:
+                continue
+
+            # Find dominant (largest) font size in this line
+            dominant_size = max(s["font_size"] for s in line_spans)
+
+            # Build line text with super/sub detection
+            line_text = ""
+            for span in line_spans:
+                text = span["text"]
+
+                if dominant_size > 0 and span["font_size"] < dominant_size * 0.82:
+                    # Significantly smaller font → check vertical position
+                    dom_spans = [s for s in line_spans
+                                 if s["font_size"] >= dominant_size * 0.82]
+                    if dom_spans:
+                        dom_mid = sum((s["top_y"] + s["bot_y"]) / 2
+                                      for s in dom_spans) / len(dom_spans)
+                        span_mid = (span["top_y"] + span["bot_y"]) / 2
+
+                        if span_mid < dom_mid - 0.3:
+                            text = f"<sup>{text}</sup>"
+                        elif span_mid > dom_mid + 0.3:
+                            text = f"<sub>{text}</sub>"
+
+                line_text += text
+
+            stripped = line_text.strip()
+            if stripped:
+                block_lines.append(stripped)
+
+        # Join lines in same block as one paragraph
+        para = " ".join(block_lines)
+        if para.strip() and len(para.strip()) > 1:
+            paragraphs.append(para.strip())
+
+    return paragraphs
+
+
+@app.post("/extract-gpmi")
+async def extract_gpmi(file: UploadFile = File(...)):
+    """
+    Extract PDF text in GPMI format — paragraph-indexed with <sup>/<sub> preserved.
+    Output matches the DOCX extractor: { paragraphCount, text, fileName }
+    where text = "[0] first para\\n[1] second para\\n..."
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    try:
+        pdf_bytes = await file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        all_paragraphs = []
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            all_paragraphs.extend(_extract_gpmi_page(page))
+
+        doc.close()
+
+        indexed_text = "\n".join(f"[{i}] {p}" for i, p in enumerate(all_paragraphs))
+        clean_name = file.filename.rsplit(".", 1)[0] if "." in file.filename else file.filename
+
+        return JSONResponse(content={
+            "paragraphCount": len(all_paragraphs),
+            "text": indexed_text,
+            "fileName": clean_name,
+            "fileType": "pdf",
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GPMI extraction failed: {str(e)}")
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "artwork-extractor", "version": "2.0.0"}
@@ -554,6 +664,7 @@ async def root():
         ],
         "endpoints": {
             "POST /extract": "Upload PDF and extract artwork data",
+            "POST /extract-gpmi": "Upload PDF and extract GPMI-format text with sup/sub preserved",
             "POST /html-to-pdf": "Convert HTML string to PDF binary",
             "GET /health": "Health check",
         },
