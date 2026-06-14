@@ -10,6 +10,7 @@ import math
 import io
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from typing import Any, Optional
 from playwright.async_api import async_playwright
 
@@ -32,7 +33,7 @@ PAGE_CONFIG = {
     2: {"key": "page3", "name": "insert front"},
     3: {"key": "page4", "name": "insert back"},
 }
-SKIP_PAGES = [4]
+SKIP_PAGES = []  # Removed hardcoded [4] to allow processing all pages
 
 # ─── Annotation detection ────────────────────────────────────
 ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#196ea6"}
@@ -411,14 +412,45 @@ def extract_images(page: fitz.Page, doc: fitz.Document) -> list:
 # PAGE-LEVEL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
+def _detect_page_name_from_content(sections: dict, default_name: str) -> str:
+    """Dynamically detect page name from 'Component Type' text spans."""
+    spans = sections.get("header_table", []) + sections.get("body", [])
+
+    for span in spans:
+        text = span.get("text", "").strip()
+        if "component type" in text.lower():
+            inline_val = re.sub(r'(?i)^.*component type\s*[:\-]?\s*', '', text).strip()
+            if inline_val:
+                return inline_val
+
+            my_bbox = span["bbox"]
+            my_cy = (my_bbox[1] + my_bbox[3]) / 2
+
+            candidates = []
+            for other in spans:
+                if other == span:
+                    continue
+                ob = other["bbox"]
+                ocy = (ob[1] + ob[3]) / 2
+                if abs(ocy - my_cy) < 15 and ob[0] > my_bbox[0]:
+                    candidates.append(other)
+
+            if candidates:
+                candidates.sort(key=lambda x: x["bbox"][0])
+                val = candidates[0].get("text", "").strip()
+                if val:
+                    return val
+
+    return default_name
+
+
 def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> dict:
     """Extract all data from a single page with enhanced features."""
-    config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": "unknown"})
+    config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
 
     rect = page.rect
     width_pt, height_pt = rect.width, rect.height
     header_threshold = height_pt * 0.20
-    is_insert = page_index in [2, 3]
 
     # 1. Paths first (zone detection needs them)
     paths = extract_paths_enhanced(page)
@@ -426,10 +458,20 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     # 2. Zone detection
     zones = detect_zones(paths, width_pt, height_pt, header_threshold)
 
-    # 3. Text extraction
-    sections = extract_text_spans_enhanced(page, header_threshold, is_insert)
+    # 3. Initial text extraction (without insert logic to get raw text)
+    sections = extract_text_spans_enhanced(page, header_threshold, is_insert=False)
 
-    # 4. Assign spans to zones
+    # 4. Detect dynamic page name from extracted text
+    detected_name = _detect_page_name_from_content(sections, config["name"])
+
+    # 5. Check if it's actually an insert based on REAL content
+    is_insert = "insert" in detected_name.lower()
+
+    # 6. Re-extract with proper line spacing if it is an insert
+    if is_insert:
+        sections = extract_text_spans_enhanced(page, header_threshold, is_insert=True)
+
+    # 7. Assign spans to zones
     for span in sections["body"]:
         span["zone"] = assign_span_to_zone(span["bbox"], zones)
 
@@ -477,7 +519,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
         clean_zones.append({k: v for k, v in z.items() if k != "bbox_pt"})
 
     return {
-        "name": config["name"],
+        "name": detected_name,
         "sections": sections,
         "body_text": body_text,
         "rotated_elements": rotated_elements,
@@ -507,13 +549,14 @@ def extract_artwork(pdf_bytes: bytes) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     result = {}
 
-    for page_index in range(min(len(doc), 5)):
-        if page_index in SKIP_PAGES or page_index > 3:
+    # Iterate dynamically over all pages instead of capping at 5
+    for page_index in range(len(doc)):
+        if page_index in SKIP_PAGES:
             continue
         page = doc[page_index]
-        config = PAGE_CONFIG.get(page_index)
-        if config:
-            result[config["key"]] = extract_page_data(page, doc, page_index)
+        # Provide fallback config for pages not explicitly defined in PAGE_CONFIG
+        config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
+        result[config["key"]] = extract_page_data(page, doc, page_index)
 
     doc.close()
     return result
@@ -530,7 +573,8 @@ async def extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     try:
         pdf_bytes = await file.read()
-        result = extract_artwork(pdf_bytes)
+        # Run in threadpool to avoid blocking the async event loop for large PDFs
+        result = await run_in_threadpool(extract_artwork, pdf_bytes)
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
