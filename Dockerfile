@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (PyMuPDF + Chromium runtime deps)
+# Install system dependencies (PyMuPDF + Chromium runtime deps + Tesseract OCR)
 RUN apt-get update && apt-get install -y \
     build-essential \
     libgl1 \
@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     fonts-unifont \
     libxfixes3 \
+    tesseract-ocr \
+    tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)
