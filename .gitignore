@@ -1,1 +1,3 @@
 suggest
+__pycache__/
+*.pyc

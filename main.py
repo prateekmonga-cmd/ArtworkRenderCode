@@ -10,6 +10,8 @@ import math
 import io
 import base64
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
@@ -71,6 +73,15 @@ PAGE_CONFIG = {
     3: {"key": "page4", "name": "insert back"},
 }
 SKIP_PAGES = []  # Removed hardcoded [4] to allow processing all pages
+
+# ─── OCR performance bounds ──────────────────────────────────
+# OCR is a targeted fallback, not a bulk pass. A page riddled with corrupt
+# spans is handled by the downstream vision cross-check instead — OCR-ing
+# hundreds of spans serially is what caused the 15-min /extract hang.
+OCR_DPI = 200                     # 200 DPI: ~20px glyphs on 6-7pt pharma print (150 was borderline)
+OCR_SPAN_CAP = 15                 # >this many guessed spans on a page → skip OCR, flag page
+OCR_MAX_WORKERS = 4               # bounded parallel Tesseract calls (Render CPU is small)
+EXTRACTION_TIME_BUDGET_S = 120    # wall-clock guard: degrade gracefully, never 502
 
 # ─── Annotation detection ────────────────────────────────────
 ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#196ea6"}
@@ -226,31 +237,93 @@ def repair_text(text: str) -> tuple:
 # OCR CROP FALLBACK (for guessed corruption repairs)
 # ═══════════════════════════════════════════════════════════════
 
-def ocr_span_bbox(page: fitz.Page, bbox, dpi: int = 300) -> Optional[str]:
-    """Render just this span's bbox region and OCR it.
+def ocr_guessed_spans(page: fitz.Page, sections: dict,
+                      deadline: Optional[float] = None) -> dict:
+    """Post-extraction OCR pass for spans flagged corruption_confidence=='guessed'.
 
-    Used only for spans whose repair was a guess — reads rendered pixels,
-    sidestepping the broken ToUnicode CMap entirely. Returns the OCR text
-    or None if OCR is unavailable/failed/empty.
+    Bounded by design (this used to run per-span, serially, re-rasterizing the
+    page region each time — 15-minute hangs on corrupt pharma PDFs):
+      - skips entirely if more than OCR_SPAN_CAP spans are flagged (the page is
+        badly broken; the downstream vision cross-check reads the page image),
+      - renders the page bitmap ONCE at OCR_DPI and crops spans in memory,
+      - runs Tesseract calls in a small thread pool,
+      - respects the extraction wall-clock deadline.
+
+    Mutates the flagged spans in place (sets ocr_text / corruption_confidence)
+    and returns a status dict for extraction_meta.
     """
+    guessed = [s for s in sections["header_table"] + sections["body"]
+               if s.get("corruption_confidence") == "guessed"]
+    if not guessed:
+        return {"ocr_spans": 0, "ocr_skipped_reason": None}
     if not TESSERACT_AVAILABLE:
-        return None
+        return {"ocr_spans": 0, "ocr_skipped_reason": "ocr_unavailable"}
+    if len(guessed) > OCR_SPAN_CAP:
+        logger.warning(
+            "Skipping OCR: %d guessed spans exceeds cap of %d — page flagged for review",
+            len(guessed), OCR_SPAN_CAP,
+        )
+        return {"ocr_spans": 0,
+                "ocr_skipped_reason": "ocr_skipped_too_many_corrupt_spans"}
+    if deadline is not None and time.monotonic() > deadline:
+        return {"ocr_spans": 0, "ocr_skipped_reason": "extraction_timeout"}
+
     try:
-        # Pad slightly so glyph edges aren't clipped
-        clip = fitz.Rect(bbox) + (-2, -2, 2, 2)
-        clip = clip & page.rect  # keep inside the page
-        if clip.is_empty:
-            return None
-        pix = page.get_pixmap(clip=clip, dpi=dpi)
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
-        # psm 7 = treat image as a single text line (spans are single-line)
-        text = pytesseract.image_to_string(
-            img, lang=get_ocr_lang(), config="--psm 7"
-        ).strip()
-        return text or None
+        # One rasterization per page, cropped in memory per span
+        scale = OCR_DPI / 72
+        pix = page.get_pixmap(dpi=OCR_DPI)
+        page_img = Image.open(io.BytesIO(pix.tobytes("png")))
     except Exception as e:
-        logger.warning(f"OCR crop failed for bbox {list(bbox)}: {e}")
-        return None
+        logger.warning(f"OCR page render failed: {e}")
+        return {"ocr_spans": 0, "ocr_skipped_reason": "ocr_render_failed"}
+
+    pad = round(2 * scale)  # ~2pt padding so glyph edges aren't clipped
+
+    def do_ocr(span):
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        try:
+            x0, y0, x1, y1 = span["bbox"]
+            crop = page_img.crop((
+                max(0, int(x0 * scale) - pad),
+                max(0, int(y0 * scale) - pad),
+                min(page_img.width, int(x1 * scale) + pad),
+                min(page_img.height, int(y1 * scale) + pad),
+            ))
+            if crop.width < 2 or crop.height < 2:
+                return None
+            # psm 7 = treat image as a single text line (spans are single-line)
+            return pytesseract.image_to_string(
+                crop, lang=get_ocr_lang(), config="--psm 7"
+            ).strip() or None
+        except Exception as e:
+            logger.warning(f"OCR crop failed for bbox {span.get('bbox')}: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(OCR_MAX_WORKERS, len(guessed))) as pool:
+        results = list(pool.map(do_ocr, guessed))
+
+    disagreements = 0
+    for span, ocr_text in zip(guessed, results):
+        span["ocr_text"] = ocr_text
+        if ocr_text is not None:
+            if (_normalize_for_ocr_compare(ocr_text)
+                    != _normalize_for_ocr_compare(span["text"])):
+                span["corruption_confidence"] = "ocr_disagreement"
+                disagreements += 1
+            else:
+                # OCR independently confirms the guess — treat as resolved
+                span["corruption_confidence"] = "ocr_confirmed"
+        logger.info(
+            "Guessed ligature repair: font=%r guessed=%r ocr=%r confidence=%s",
+            span.get("font_name_full"), span["text"], ocr_text,
+            span["corruption_confidence"],
+        )
+
+    timed_out = deadline is not None and time.monotonic() > deadline
+    return {"ocr_spans": len(guessed),
+            "ocr_disagreements": disagreements,
+            "ocr_skipped_reason": "extraction_timeout" if timed_out else None}
 
 
 def _normalize_for_ocr_compare(text: str) -> str:
@@ -338,8 +411,7 @@ def assign_span_to_zone(span_bbox: list, zones: list) -> Optional[str]:
 # EXTRACTION FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
-def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
-                                 is_insert: bool) -> dict:
+def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dict:
     """Extract text with rotation, repair, and annotation filtering."""
     header_table = []
     body = []
@@ -382,18 +454,8 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
 
                 repaired_text, was_repaired, repair_log, corruption_confidence = repair_text(raw_text)
 
-                # OCR crop fallback: only for guessed repairs (cheap, targeted)
-                ocr_text = None
-                if corruption_confidence == "guessed":
-                    ocr_text = ocr_span_bbox(page, bbox)
-                    if ocr_text is not None:
-                        if _normalize_for_ocr_compare(ocr_text) != _normalize_for_ocr_compare(repaired_text):
-                            # OCR disagrees with the guess — flag for audit
-                            corruption_confidence = "ocr_disagreement"
-                    logger.info(
-                        "Guessed ligature repair: font=%r raw=%r guessed=%r ocr=%r confidence=%s",
-                        font_name, raw_text, repaired_text, ocr_text, corruption_confidence,
-                    )
+                # NOTE: OCR for guessed repairs happens in ocr_guessed_spans()
+                # as a bounded post-pass — never per-span in this hot loop.
 
                 # Annotation check
                 if is_annotation(repaired_text, color_hex):
@@ -426,7 +488,7 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
                     "repaired": was_repaired,
                     "repair_log": repair_log if was_repaired else None,
                     "corruption_confidence": corruption_confidence,
-                    "ocr_text": ocr_text,
+                    "ocr_text": None,  # filled by ocr_guessed_spans() post-pass
                     "font_name": get_base_font_name(font_name),
                     "font_name_full": font_name,
                     "font_size_pt": font_size,
@@ -450,14 +512,16 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
     # Sort body by position
     body_spans_with_pos.sort(key=lambda x: (x["y0"], x["data"]["bbox"][0]))
 
-    # Line spacing for inserts
+    # Line spacing: always computed here (cheap O(n)); extract_page_data strips
+    # the key for non-insert pages. This avoids re-parsing the entire page a
+    # second time just to add spacing when a page turns out to be an insert.
     for i, info in enumerate(body_spans_with_pos):
-        sd = info["data"].copy()
-        if is_insert and i < len(body_spans_with_pos) - 1:
+        sd = info["data"]
+        if i < len(body_spans_with_pos) - 1:
             gap = body_spans_with_pos[i + 1]["y0"] - info["y1"]
             fs = info["font_size"]
             sd["line_spacing"] = round((gap + fs) / fs, 2) if fs > 0 else None
-        elif is_insert:
+        else:
             sd["line_spacing"] = None
         body.append(sd)
 
@@ -493,7 +557,7 @@ def extract_paths_enhanced(page: fitz.Page) -> list:
     return paths
 
 
-def extract_images(page: fitz.Page, doc: fitz.Document) -> list:
+def extract_images(page: fitz.Page) -> list:
     """Extract all embedded images with metadata."""
     images = []
     try:
@@ -503,17 +567,14 @@ def extract_images(page: fitz.Page, doc: fitz.Document) -> list:
 
     for img_info in image_list:
         xref = img_info[0]
+        # Pixel dimensions come straight from the get_images() tuple —
+        # doc.extract_image() would decode the full image binary just to
+        # read the same width/height, which is wasteful on artwork PDFs.
+        width_px = img_info[2] if len(img_info) > 2 else 0
+        height_px = img_info[3] if len(img_info) > 3 else 0
         try:
             img_rects = page.get_image_rects(xref)
             for rect in img_rects:
-                try:
-                    base_image = doc.extract_image(xref)
-                    width_px = base_image.get("width", 0)
-                    height_px = base_image.get("height", 0)
-                except Exception:
-                    width_px = img_info[2] if len(img_info) > 2 else 0
-                    height_px = img_info[3] if len(img_info) > 3 else 0
-
                 image_data = {
                     "bbox": [snap_coord(r) for r in rect],
                     "bbox_mm": bbox_to_mm(rect),
@@ -623,7 +684,8 @@ def _detect_page_name_from_content(sections: dict, default_name: str) -> tuple:
     return default_name, False
 
 
-def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> dict:
+def extract_page_data(page: fitz.Page, page_index: int,
+                      deadline: Optional[float] = None) -> dict:
     """Extract all data from a single page with enhanced features."""
     config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
 
@@ -637,8 +699,9 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     # 2. Zone detection
     zones = detect_zones(paths, width_pt, height_pt, header_threshold)
 
-    # 3. Initial text extraction (without insert logic to get raw text)
-    sections = extract_text_spans_enhanced(page, header_threshold, is_insert=False)
+    # 3. Text extraction — single pass; line_spacing is always computed and
+    # stripped below for non-insert pages (no second full parse needed)
+    sections = extract_text_spans_enhanced(page, header_threshold)
 
     # 4. Detect dynamic page name from extracted text
     detected_name, page_name_detected = _detect_page_name_from_content(sections, config["name"])
@@ -646,9 +709,14 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     # 5. Check if it's actually an insert based on REAL content
     is_insert = "insert" in detected_name.lower()
 
-    # 6. Re-extract with proper line spacing if it is an insert
-    if is_insert:
-        sections = extract_text_spans_enhanced(page, header_threshold, is_insert=True)
+    # 6. Non-inserts don't expose line_spacing (preserves original output shape)
+    if not is_insert:
+        for span in sections["body"]:
+            span.pop("line_spacing", None)
+
+    # 6b. Bounded OCR post-pass for guessed repairs — runs ONCE, after the
+    # final sections are settled (never inside the span hot loop).
+    ocr_info = ocr_guessed_spans(page, sections, deadline)
 
     # 7. Assign spans to zones
     for span in sections["body"]:
@@ -670,7 +738,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     sections["body"].sort(key=_col_sort_key)
 
     # 5. Images
-    images = extract_images(page, doc)
+    images = extract_images(page)
 
     # 6. Build convenience strings
     body_normal = [s["text"] for s in sections["body"] if s.get("rotation_deg", 0) == 0]
@@ -691,7 +759,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     )
     guessed_fonts = sorted({
         s.get("font_name_full") for s in all_spans
-        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement")
+        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement", "ocr_confirmed")
     })
 
     # Clean up paths for output
@@ -728,6 +796,8 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
             "zones_detected": len(zones),
             "rotated_elements_count": len(rotated_elements),
             "page_name_detected": page_name_detected,
+            "ocr_spans": ocr_info.get("ocr_spans", 0),
+            "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
         },
         # One clean object the workflow can branch on
         "extraction_confidence": {
@@ -738,10 +808,12 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
             "zones_detected": len(zones),
             "page_name_detected": page_name_detected,
             "ocr_available": TESSERACT_AVAILABLE,
+            "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
             "needs_review": (
                 unresolved_corruption_count > 0
                 or not page_name_detected
                 or len(sections.get("annotation_near_misses", [])) > 0
+                or ocr_info.get("ocr_skipped_reason") is not None
             ),
         },
     }
@@ -771,6 +843,10 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     result = {}
     failed_pages = []
+    # Wall-clock guard: heavy optional work (OCR) degrades gracefully instead
+    # of blowing past the platform proxy timeout and 502-ing the whole request.
+    start = time.monotonic()
+    deadline = start + EXTRACTION_TIME_BUDGET_S
 
     # Iterate dynamically over all pages instead of capping at 5
     for page_index in range(len(doc)):
@@ -781,7 +857,7 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
         # Per-page isolation: one bad page must not lose the whole document
         try:
-            page_data = extract_page_data(page, doc, page_index)
+            page_data = extract_page_data(page, page_index, deadline)
         except Exception as e:
             logger.exception(f"Page {page_index + 1} extraction failed ({filename})")
             failed_pages.append(page_index + 1)
@@ -814,6 +890,12 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         p.get("extraction_meta", {}).get("unresolved_corruption_count", 0)
         for p in result.values()
     )
+    elapsed = round(time.monotonic() - start, 2)
+    ocr_skip_reasons = sorted({
+        r for p in result.values()
+        for r in [p.get("extraction_confidence", {}).get("ocr_skipped_reason")]
+        if r
+    })
     result["document_meta"] = {
         "filename": filename,
         "page_count": len([k for k in result if k.startswith("page")]),
@@ -821,12 +903,16 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         "total_repairs_applied": total_repairs,
         "total_unresolved_corruption": total_unresolved,
         "ocr_available": TESSERACT_AVAILABLE,
+        "ocr_skip_reasons": ocr_skip_reasons,
+        "extraction_seconds": elapsed,
         "needs_review": needs_review,
     }
     logger.info(
-        "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d needs_review=%s",
+        "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d "
+        "ocr_skips=%s needs_review=%s elapsed=%.2fs",
         filename or "<upload>", result["document_meta"]["page_count"],
-        failed_pages, total_repairs, total_unresolved, needs_review,
+        failed_pages, total_repairs, total_unresolved,
+        ocr_skip_reasons, needs_review, elapsed,
     )
     return result
 
@@ -846,6 +932,8 @@ async def extract_pdf(file: UploadFile = File(...), render: bool = False,
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
+    if render and not 30 <= render_dpi <= 600:
+        raise HTTPException(status_code=400, detail="render_dpi must be between 30 and 600")
     try:
         pdf_bytes = await file.read()
         # Run in threadpool to avoid blocking the async event loop for large PDFs
