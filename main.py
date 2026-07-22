@@ -8,11 +8,48 @@ import fitz  # PyMuPDF
 import re
 import math
 import io
+import base64
+import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from typing import Any, Optional
 from playwright.async_api import async_playwright
+
+logger = logging.getLogger("artwork-extractor")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+# ─── Optional OCR support (graceful degrade if tesseract missing) ───
+try:
+    import pytesseract
+    from PIL import Image
+    try:
+        pytesseract.get_tesseract_version()
+        TESSERACT_AVAILABLE = True
+    except Exception:
+        TESSERACT_AVAILABLE = False
+        logger.warning("pytesseract installed but tesseract binary not found — OCR fallback disabled")
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    logger.warning("pytesseract/Pillow not installed — OCR fallback disabled")
+
+_ocr_lang = None
+
+def get_ocr_lang() -> str:
+    """Prefer Spanish+English if the spa language pack is installed."""
+    global _ocr_lang
+    if _ocr_lang is None:
+        _ocr_lang = "eng"
+        try:
+            if "spa" in pytesseract.get_languages(config=""):
+                _ocr_lang = "spa+eng"
+        except Exception:
+            pass
+    return _ocr_lang
 
 # Global browser instance (reused across requests)
 _playwright = None
@@ -129,43 +166,96 @@ def snap_coord(coord: float) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 def repair_text(text: str) -> tuple:
-    """Repair ligature corruption. Returns (repaired, was_repaired, repairs)."""
+    """Repair ligature corruption.
+
+    Returns (repaired, was_repaired, repairs, confidence) where confidence is:
+      - None      -> text was untouched
+      - "high"    -> only known/validated corrections applied (KNOWN_CORRECTIONS,
+                     standard fi/fl ligatures, soft-hyphen removal)
+      - "guessed" -> the blanket U+FFFD->"ti" or soft-hyphen->"ti" fallback fired;
+                     downstream should treat this text as unverified
+    """
     if '\ufffd' not in text and '\xad' not in text and '\ufb01' not in text and '\ufb02' not in text:
-        return text, False, []
+        return text, False, [], None
 
     repairs = []
     repaired = text
+    guessed = False
 
     # 1. Known word corrections (case-sensitive)
     for broken, fixed in KNOWN_CORRECTIONS.items():
         if broken in repaired:
             repaired = repaired.replace(broken, fixed)
-            repairs.append({"from": broken, "to": fixed, "type": "known_word"})
+            repairs.append({"from": broken, "to": fixed, "type": "known_word",
+                            "confidence": "high"})
 
     # 2. Remaining U+FFFD → assume "ti" ligature (dominant in pharma fonts)
     if '\ufffd' in repaired:
         repaired = repaired.replace('\ufffd', 'ti')
-        repairs.append({"from": "U+FFFD", "to": "ti", "type": "ligature_ti"})
+        repairs.append({"from": "U+FFFD", "to": "ti", "type": "ligature_ti",
+                        "confidence": "guessed"})
+        guessed = True
 
     # 3. Soft hyphens — only replace with 'ti' when between letters (ligature artifact)
     if '\xad' in repaired:
         # Only replace \xad when it sits between two word characters (ligature gap)
         new_text = re.sub(r'(?<=\w)\xad(?=\w)', 'ti', repaired)
         if new_text != repaired:
-            repairs.append({"from": "U+00AD", "to": "ti", "type": "soft_hyphen_ligature"})
+            repairs.append({"from": "U+00AD", "to": "ti", "type": "soft_hyphen_ligature",
+                            "confidence": "guessed"})
             repaired = new_text
+            guessed = True
         else:
             # Standalone soft hyphen — just remove it
             repaired = repaired.replace('\xad', '')
-            repairs.append({"from": "U+00AD", "to": "", "type": "soft_hyphen_removed"})
+            repairs.append({"from": "U+00AD", "to": "", "type": "soft_hyphen_removed",
+                            "confidence": "high"})
 
     # 4. Standard ligature chars
     for lig, rep in {'\ufb01': 'fi', '\ufb02': 'fl'}.items():
         if lig in repaired:
             repaired = repaired.replace(lig, rep)
-            repairs.append({"from": f"U+{ord(lig):04X}", "to": rep, "type": "ligature"})
+            repairs.append({"from": f"U+{ord(lig):04X}", "to": rep, "type": "ligature",
+                            "confidence": "high"})
 
-    return repaired, len(repairs) > 0, repairs
+    confidence = "guessed" if guessed else ("high" if repairs else None)
+    return repaired, len(repairs) > 0, repairs, confidence
+
+
+# ═══════════════════════════════════════════════════════════════
+# OCR CROP FALLBACK (for guessed corruption repairs)
+# ═══════════════════════════════════════════════════════════════
+
+def ocr_span_bbox(page: fitz.Page, bbox, dpi: int = 300) -> Optional[str]:
+    """Render just this span's bbox region and OCR it.
+
+    Used only for spans whose repair was a guess — reads rendered pixels,
+    sidestepping the broken ToUnicode CMap entirely. Returns the OCR text
+    or None if OCR is unavailable/failed/empty.
+    """
+    if not TESSERACT_AVAILABLE:
+        return None
+    try:
+        # Pad slightly so glyph edges aren't clipped
+        clip = fitz.Rect(bbox) + (-2, -2, 2, 2)
+        clip = clip & page.rect  # keep inside the page
+        if clip.is_empty:
+            return None
+        pix = page.get_pixmap(clip=clip, dpi=dpi)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        # psm 7 = treat image as a single text line (spans are single-line)
+        text = pytesseract.image_to_string(
+            img, lang=get_ocr_lang(), config="--psm 7"
+        ).strip()
+        return text or None
+    except Exception as e:
+        logger.warning(f"OCR crop failed for bbox {list(bbox)}: {e}")
+        return None
+
+
+def _normalize_for_ocr_compare(text: str) -> str:
+    """Normalize text for OCR-vs-repair comparison (whitespace/case tolerant)."""
+    return re.sub(r'\s+', ' ', text).strip().lower()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -254,6 +344,7 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
     header_table = []
     body = []
     annotations = []
+    annotation_near_misses = []
 
     text_dict = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
     body_spans_with_pos = []
@@ -289,7 +380,20 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
                 else:
                     color_hex = rgb_to_hex(color)
 
-                repaired_text, was_repaired, repair_log = repair_text(raw_text)
+                repaired_text, was_repaired, repair_log, corruption_confidence = repair_text(raw_text)
+
+                # OCR crop fallback: only for guessed repairs (cheap, targeted)
+                ocr_text = None
+                if corruption_confidence == "guessed":
+                    ocr_text = ocr_span_bbox(page, bbox)
+                    if ocr_text is not None:
+                        if _normalize_for_ocr_compare(ocr_text) != _normalize_for_ocr_compare(repaired_text):
+                            # OCR disagrees with the guess — flag for audit
+                            corruption_confidence = "ocr_disagreement"
+                    logger.info(
+                        "Guessed ligature repair: font=%r raw=%r guessed=%r ocr=%r confidence=%s",
+                        font_name, raw_text, repaired_text, ocr_text, corruption_confidence,
+                    )
 
                 # Annotation check
                 if is_annotation(repaired_text, color_hex):
@@ -302,11 +406,27 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
                     })
                     continue
 
+                # Near-miss: looks like a dimension marker but color not in
+                # ANNOTATION_COLORS — either a new annotation color we haven't
+                # added yet, or a real body-text dimension. Log + flag it.
+                if DIMENSION_PATTERN.match(repaired_text.strip()) and color_hex.lower() not in ANNOTATION_COLORS:
+                    annotation_near_misses.append({
+                        "text": repaired_text,
+                        "color_hex": color_hex,
+                        "bbox_mm": bbox_to_mm(bbox),
+                    })
+                    logger.info(
+                        "Annotation near-miss: dimension-like text %r with color %s not in ANNOTATION_COLORS",
+                        repaired_text, color_hex,
+                    )
+
                 span_data = {
                     "text": repaired_text,
                     "text_raw": raw_text if was_repaired else None,
                     "repaired": was_repaired,
                     "repair_log": repair_log if was_repaired else None,
+                    "corruption_confidence": corruption_confidence,
+                    "ocr_text": ocr_text,
                     "font_name": get_base_font_name(font_name),
                     "font_name_full": font_name,
                     "font_size_pt": font_size,
@@ -341,7 +461,8 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float,
             sd["line_spacing"] = None
         body.append(sd)
 
-    return {"header_table": header_table, "body": body, "annotations": annotations}
+    return {"header_table": header_table, "body": body, "annotations": annotations,
+            "annotation_near_misses": annotation_near_misses}
 
 
 def extract_paths_enhanced(page: fitz.Page) -> list:
@@ -412,16 +533,74 @@ def extract_images(page: fitz.Page, doc: fitz.Document) -> list:
 # PAGE-LEVEL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
-def _detect_page_name_from_content(sections: dict, default_name: str) -> str:
-    """Dynamically detect page name from 'Component Type' text spans."""
+# Fuzzy "component type" matching — tolerate one corrupted/missing/extra char
+# per word so a corrupted span doesn't silently fall back to the generic
+# default page name.
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """True if a and b are within Levenshtein distance 1."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    # la <= lb, differ by 0 or 1
+    i = j = 0
+    edits = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            edits += 1
+            if edits > 1:
+                return False
+            if la == lb:
+                i += 1  # substitution
+            j += 1      # deletion in b (or skip)
+    edits += (lb - j) + (la - i)
+    return edits <= 1
+
+
+def _find_component_type_end(text: str) -> Optional[int]:
+    """Find 'component type' in text (exact, then fuzzy with 1-char tolerance
+    per word). Returns the index just past the match, or None."""
+    m = re.search(r'(?i)component\s+type', text)
+    if m:
+        return m.end()
+    # Fuzzy: scan consecutive word pairs
+    for wm in re.finditer(r'\S+', text):
+        w1 = wm.group()
+        rest = text[wm.end():]
+        wm2 = re.match(r'\s+(\S+)', rest)
+        if not wm2:
+            continue
+        w2 = wm2.group(1)
+        # Strip trailing punctuation like ':' from w2 for comparison
+        w2_clean = w2.rstrip(':-')
+        if (_within_one_edit(w1.lower(), 'component')
+                and _within_one_edit(w2_clean.lower(), 'type')):
+            return wm.end() + wm2.end() - (len(w2) - len(w2_clean))
+    return None
+
+
+def _detect_page_name_from_content(sections: dict, default_name: str) -> tuple:
+    """Dynamically detect page name from 'Component Type' text spans.
+
+    Returns (name, detected) — detected=False means we fell back to the
+    generic default_name and page-name detection effectively failed.
+    """
     spans = sections.get("header_table", []) + sections.get("body", [])
 
     for span in spans:
         text = span.get("text", "").strip()
-        if "component type" in text.lower():
-            inline_val = re.sub(r'(?i)^.*component type\s*[:\-]?\s*', '', text).strip()
+        match_end = _find_component_type_end(text)
+        if match_end is not None:
+            inline_val = re.sub(r'^\s*[:\-]?\s*', '', text[match_end:]).strip()
             if inline_val:
-                return inline_val
+                return inline_val, True
 
             my_bbox = span["bbox"]
             my_cy = (my_bbox[1] + my_bbox[3]) / 2
@@ -439,9 +618,9 @@ def _detect_page_name_from_content(sections: dict, default_name: str) -> str:
                 candidates.sort(key=lambda x: x["bbox"][0])
                 val = candidates[0].get("text", "").strip()
                 if val:
-                    return val
+                    return val, True
 
-    return default_name
+    return default_name, False
 
 
 def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> dict:
@@ -462,7 +641,7 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
     sections = extract_text_spans_enhanced(page, header_threshold, is_insert=False)
 
     # 4. Detect dynamic page name from extracted text
-    detected_name = _detect_page_name_from_content(sections, config["name"])
+    detected_name, page_name_detected = _detect_page_name_from_content(sections, config["name"])
 
     # 5. Check if it's actually an insert based on REAL content
     is_insert = "insert" in detected_name.lower()
@@ -503,9 +682,17 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
         for s in sections["body"] if s.get("rotation_deg", 0) != 0
     ]
 
-    # Count repairs
-    repair_count = sum(1 for s in sections["body"] if s.get("repaired"))
-    repair_count += sum(1 for s in sections["header_table"] if s.get("repaired"))
+    # Count repairs + unresolved (guessed / OCR-disagreement) corruption
+    all_spans = sections["body"] + sections["header_table"]
+    repair_count = sum(1 for s in all_spans if s.get("repaired"))
+    unresolved_corruption_count = sum(
+        1 for s in all_spans
+        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement")
+    )
+    guessed_fonts = sorted({
+        s.get("font_name_full") for s in all_spans
+        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement")
+    })
 
     # Clean up paths for output
     clean_paths = []
@@ -534,9 +721,28 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
         "images": images,
         "extraction_meta": {
             "text_repairs_applied": repair_count,
+            "unresolved_corruption_count": unresolved_corruption_count,
+            "guessed_repair_fonts": guessed_fonts,
             "annotations_filtered": len(sections["annotations"]),
+            "annotation_near_misses": len(sections.get("annotation_near_misses", [])),
             "zones_detected": len(zones),
             "rotated_elements_count": len(rotated_elements),
+            "page_name_detected": page_name_detected,
+        },
+        # One clean object the workflow can branch on
+        "extraction_confidence": {
+            "repairs_applied": repair_count,
+            "unresolved_corruption_count": unresolved_corruption_count,
+            "annotations_filtered": len(sections["annotations"]),
+            "annotation_near_misses": len(sections.get("annotation_near_misses", [])),
+            "zones_detected": len(zones),
+            "page_name_detected": page_name_detected,
+            "ocr_available": TESSERACT_AVAILABLE,
+            "needs_review": (
+                unresolved_corruption_count > 0
+                or not page_name_detected
+                or len(sections.get("annotation_near_misses", [])) > 0
+            ),
         },
     }
 
@@ -545,9 +751,26 @@ def extract_page_data(page: fitz.Page, doc: fitz.Document, page_index: int) -> d
 # DOCUMENT-LEVEL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
-def extract_artwork(pdf_bytes: bytes) -> dict:
+def render_page_png(page: fitz.Page, dpi: int = 200) -> dict:
+    """Render a page to base64 PNG with the scale info needed to map
+    pixel coordinates back to the pt/mm bboxes returned by /extract."""
+    pix = page.get_pixmap(dpi=dpi)
+    return {
+        "png_base64": base64.b64encode(pix.tobytes("png")).decode("ascii"),
+        "dpi": dpi,
+        "width_px": pix.width,
+        "height_px": pix.height,
+        # px = pt * (dpi / 72); mm = px / px_per_mm
+        "scale_px_per_pt": round(dpi / 72, 6),
+        "scale_px_per_mm": round(dpi / 72 / PT_TO_MM, 6),
+    }
+
+
+def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
+                    render_dpi: int = 200) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     result = {}
+    failed_pages = []
 
     # Iterate dynamically over all pages instead of capping at 5
     for page_index in range(len(doc)):
@@ -556,9 +779,55 @@ def extract_artwork(pdf_bytes: bytes) -> dict:
         page = doc[page_index]
         # Provide fallback config for pages not explicitly defined in PAGE_CONFIG
         config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
-        result[config["key"]] = extract_page_data(page, doc, page_index)
+        # Per-page isolation: one bad page must not lose the whole document
+        try:
+            page_data = extract_page_data(page, doc, page_index)
+        except Exception as e:
+            logger.exception(f"Page {page_index + 1} extraction failed ({filename})")
+            failed_pages.append(page_index + 1)
+            page_data = {
+                "name": config["name"],
+                "error": f"Page extraction failed: {str(e)}",
+                "extraction_confidence": {"needs_review": True, "extraction_failed": True},
+            }
+        if render:
+            try:
+                page_data["render"] = render_page_png(page, dpi=render_dpi)
+            except Exception as e:
+                logger.exception(f"Page {page_index + 1} render failed ({filename})")
+                page_data["render"] = {"error": str(e)}
+        result[config["key"]] = page_data
 
     doc.close()
+
+    # Document-level review flag — n8n should key off this to route pages
+    # to human review / vision cross-check instead of trusting them blind.
+    needs_review = bool(failed_pages) or any(
+        p.get("extraction_confidence", {}).get("needs_review")
+        for p in result.values()
+    )
+    total_repairs = sum(
+        p.get("extraction_meta", {}).get("text_repairs_applied", 0)
+        for p in result.values()
+    )
+    total_unresolved = sum(
+        p.get("extraction_meta", {}).get("unresolved_corruption_count", 0)
+        for p in result.values()
+    )
+    result["document_meta"] = {
+        "filename": filename,
+        "page_count": len([k for k in result if k.startswith("page")]),
+        "failed_pages": failed_pages,
+        "total_repairs_applied": total_repairs,
+        "total_unresolved_corruption": total_unresolved,
+        "ocr_available": TESSERACT_AVAILABLE,
+        "needs_review": needs_review,
+    }
+    logger.info(
+        "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d needs_review=%s",
+        filename or "<upload>", result["document_meta"]["page_count"],
+        failed_pages, total_repairs, total_unresolved, needs_review,
+    )
     return result
 
 
@@ -567,17 +836,59 @@ def extract_artwork(pdf_bytes: bytes) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/extract")
-async def extract_pdf(file: UploadFile = File(...)):
-    """Extract artwork compliance data from a PDF file."""
+async def extract_pdf(file: UploadFile = File(...), render: bool = False,
+                      render_dpi: int = 200):
+    """Extract artwork compliance data from a PDF file.
+
+    Query params:
+      - render=true      → include a base64 PNG render of each page (page_data["render"])
+      - render_dpi=200   → DPI for the render (used with render=true)
+    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     try:
         pdf_bytes = await file.read()
         # Run in threadpool to avoid blocking the async event loop for large PDFs
-        result = await run_in_threadpool(extract_artwork, pdf_bytes)
+        result = await run_in_threadpool(
+            extract_artwork, pdf_bytes, file.filename, render, render_dpi
+        )
         return JSONResponse(content=result)
     except Exception as e:
+        logger.exception(f"Extraction failed for {file.filename}")
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+
+def _render_all_pages(pdf_bytes: bytes, dpi: int) -> dict:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    for page_index in range(len(doc)):
+        page_render = render_page_png(doc[page_index], dpi=dpi)
+        page_render["page_number"] = page_index + 1
+        pages.append(page_render)
+    doc.close()
+    return {"page_count": len(pages), "dpi": dpi, "pages": pages}
+
+
+@app.post("/render-page")
+async def render_pages(file: UploadFile = File(...), dpi: int = 200):
+    """Render each PDF page as a base64 PNG (for vision cross-check).
+
+    Response includes the DPI and px-per-pt / px-per-mm scale factors so pixel
+    coordinates can be mapped back to /extract's bbox / bbox_mm values.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    if not 30 <= dpi <= 600:
+        raise HTTPException(status_code=400, detail="dpi must be between 30 and 600")
+    try:
+        pdf_bytes = await file.read()
+        result = await run_in_threadpool(_render_all_pages, pdf_bytes, dpi)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Render failed for {file.filename}")
+        raise HTTPException(status_code=500, detail=f"Error rendering PDF: {str(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -607,7 +918,7 @@ def _extract_gpmi_page(page: fitz.Page) -> list:
                 if not raw_text:
                     continue
 
-                repaired_text, _, _ = repair_text(raw_text)
+                repaired_text, _, _, _ = repair_text(raw_text)
 
                 line_spans.append({
                     "text": repaired_text,
@@ -692,23 +1003,32 @@ async def extract_gpmi(file: UploadFile = File(...)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "artwork-extractor", "version": "2.0.0"}
+    return {
+        "status": "healthy",
+        "service": "artwork-extractor",
+        "version": "2.1.0",
+        "ocr_available": TESSERACT_AVAILABLE,
+    }
 
 
 @app.get("/")
 async def root():
     return {
         "service": "Artwork Compliance Extractor",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "features": [
             "Zone detection (panel boundaries from fold lines)",
             "Rotation detection (flap text, rotated elements)",
-            "Ligature repair (ti, fi, fl auto-fix with audit trail)",
-            "Annotation filtering (dimension markers separated)",
+            "Ligature repair (ti, fi, fl auto-fix with audit trail + confidence tiers)",
+            "OCR crop fallback for guessed ligature repairs (needs tesseract)",
+            "Annotation filtering (dimension markers separated, near-misses flagged)",
+            "Page rendering to base64 PNG (?render=true or POST /render-page)",
+            "Per-page error isolation + needs_review flags",
         ],
         "endpoints": {
-            "POST /extract": "Upload PDF and extract artwork data",
+            "POST /extract": "Upload PDF and extract artwork data (?render=true&render_dpi=200 to include page images)",
             "POST /extract-gpmi": "Upload PDF and extract GPMI-format text with sup/sub preserved",
+            "POST /render-page": "Render each PDF page as base64 PNG (?dpi=200)",
             "POST /html-to-pdf": "Convert HTML string to PDF binary",
             "GET /health": "Health check",
         },
