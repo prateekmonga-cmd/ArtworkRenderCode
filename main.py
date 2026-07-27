@@ -88,6 +88,30 @@ ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#19
 DIMENSION_PATTERN = re.compile(r'^\s*[\d.]+\s*mm\s*$', re.IGNORECASE)
 ARROW_CHARS = {'◄', '►', '▲', '▼', '←', '→', '↑', '↓', '◀', '▶'}
 
+# ─── Print-production marks ──────────────────────────────────
+# Instructions addressed to the printer, not copy addressed to the patient:
+# "Pasting Side", "Stereo print", varnish and die-line callouts. They are on the
+# artwork file but not on the finished pack, so they are not artwork content and
+# must not be judged as such — they are the reason rule 1-1 reported an Arial
+# font violation and rule 1-18 reported English words on Spanish artwork.
+#
+# Matched as whole spans only. A production term appearing inside a real sentence
+# is left alone; these marks always sit in their own span.
+PRODUCTION_MARK_TERMS = {
+    "pasting side", "stereo print", "stereo", "die line", "dieline", "die cut",
+    "cut line", "cutline", "crease line", "fold line", "bleed line", "trim line",
+    "varnish", "varnish free", "no varnish", "matt varnish", "gloss varnish",
+    "spot uv", "overprint", "emboss", "debossing", "hot foil", "foil stamp",
+    "kiss cut", "tuck flap", "glue flap", "gusset", "artwork size", "flat size",
+    "print side", "reverse side", "inner side", "outer side", "non printing area",
+    "not to scale", "scale 1:1", "colour code", "color code", "pantone", "cmyk",
+}
+# A short standalone English phrase set in the annotation palette is the shape a
+# production mark takes. Anything matching that shape but absent from the
+# vocabulary is logged as a near-miss so new terms surface instead of silently
+# becoming compliance failures — same contract as annotation_near_misses.
+PRODUCTION_MARK_SHAPE = re.compile(r'^[A-Za-z][A-Za-z0-9 .:/\-]{2,28}$')
+
 # ─── Ligature repair ─────────────────────────────────────────
 KNOWN_CORRECTIONS = {
     'con\ufffdene': 'contiene', 'Con\ufffdene': 'Contiene',
@@ -413,6 +437,48 @@ def is_annotation(text: str, color_hex: str) -> bool:
     return (color_match and pattern_match) or arrow_match
 
 
+# How much trailing noise may follow a production term and still be the same
+# mark. "Pasting Side 1" and "Varnish Free 2" qualify; a sentence that merely
+# begins with a production word does not.
+PRODUCTION_MARK_SUFFIX_MAX = 4
+
+
+def _production_key(text: str) -> str:
+    """Normalize a span for vocabulary lookup: case, punctuation, spacing.
+
+    The colon is kept because "scale 1:1" is itself a term, then stripped from
+    the ends so "Pasting Side:" still matches "pasting side".
+    """
+    key = re.sub(r'[^a-z0-9: ]', ' ', text.lower())
+    return re.sub(r'\s+', ' ', key).strip().strip(':').strip()
+
+
+def is_production_mark(text: str) -> bool:
+    """True when a span is a printer instruction rather than artwork copy."""
+    key = _production_key(text)
+    if not key:
+        return False
+    if key in PRODUCTION_MARK_TERMS:
+        return True
+    # Tolerate a short suffix ("Pasting Side 1") but never a full sentence that
+    # happens to open with a production word ("Stereo printing instructions
+    # are documented in the batch record" is artwork copy, not a mark).
+    for term in PRODUCTION_MARK_TERMS:
+        if key.startswith(term + " ") and len(key) - len(term) <= PRODUCTION_MARK_SUFFIX_MAX:
+            return True
+    return False
+
+
+def looks_like_production_mark(text: str, color_hex: str) -> bool:
+    """Shape of a production mark without a vocabulary hit — worth logging."""
+    stripped = text.strip()
+    if not PRODUCTION_MARK_SHAPE.match(stripped):
+        return False
+    if color_hex.lower() not in ANNOTATION_COLORS:
+        return False
+    return not is_production_mark(stripped)
+
+
 # ═══════════════════════════════════════════════════════════════
 # ROTATION DETECTION
 # ═══════════════════════════════════════════════════════════════
@@ -487,6 +553,8 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
     body = []
     annotations = []
     annotation_near_misses = []
+    production_marks = []
+    production_mark_near_misses = []
 
     text_dict = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
     body_spans_with_pos = []
@@ -537,6 +605,35 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                         "bbox_mm": bbox_to_mm(bbox),
                     })
                     continue
+
+                # Print-production marks are on the artwork file but not on the
+                # finished pack. Pull them out before any compliance analysis so
+                # neither the font/size geometry nor the Spanish body text is
+                # judged against a printer instruction. They stay in the payload
+                # under production_marks so the review agents can say what was
+                # excluded and why.
+                if is_production_mark(repaired_text):
+                    production_marks.append({
+                        "text": repaired_text,
+                        "reason": "print-production mark",
+                        "font_name": get_base_font_name(font_name),
+                        "font_size_pt": font_size,
+                        "color_hex": color_hex,
+                        "bbox_mm": bbox_to_mm(bbox),
+                    })
+                    continue
+
+                if looks_like_production_mark(repaired_text, color_hex):
+                    production_mark_near_misses.append({
+                        "text": repaired_text,
+                        "color_hex": color_hex,
+                        "bbox_mm": bbox_to_mm(bbox),
+                    })
+                    logger.info(
+                        "Production-mark near-miss: %r in annotation color %s "
+                        "is not in PRODUCTION_MARK_TERMS",
+                        repaired_text, color_hex,
+                    )
 
                 # Near-miss: looks like a dimension marker but color not in
                 # ANNOTATION_COLORS — either a new annotation color we haven't
@@ -596,7 +693,9 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
         body.append(sd)
 
     return {"header_table": header_table, "body": body, "annotations": annotations,
-            "annotation_near_misses": annotation_near_misses}
+            "annotation_near_misses": annotation_near_misses,
+            "production_marks": production_marks,
+            "production_mark_near_misses": production_mark_near_misses}
 
 
 def extract_paths_enhanced(page: fitz.Page) -> list:
@@ -863,6 +962,8 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "guessed_repair_fonts": guessed_fonts,
             "annotations_filtered": len(sections["annotations"]),
             "annotation_near_misses": len(sections.get("annotation_near_misses", [])),
+            "production_marks_excluded": len(sections.get("production_marks", [])),
+            "production_mark_near_misses": len(sections.get("production_mark_near_misses", [])),
             "zones_detected": len(zones),
             "rotated_elements_count": len(rotated_elements),
             "page_name_detected": page_name_detected,
@@ -875,6 +976,8 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "unresolved_corruption_count": unresolved_corruption_count,
             "annotations_filtered": len(sections["annotations"]),
             "annotation_near_misses": len(sections.get("annotation_near_misses", [])),
+            "production_marks_excluded": len(sections.get("production_marks", [])),
+            "production_mark_near_misses": len(sections.get("production_mark_near_misses", [])),
             "zones_detected": len(zones),
             "page_name_detected": page_name_detected,
             "ocr_available": TESSERACT_AVAILABLE,
@@ -883,6 +986,7 @@ def extract_page_data(page: fitz.Page, page_index: int,
                 unresolved_corruption_count > 0
                 or not page_name_detected
                 or len(sections.get("annotation_near_misses", [])) > 0
+                or len(sections.get("production_mark_near_misses", [])) > 0
                 or ocr_info.get("ocr_skipped_reason") is not None
             ),
         },
