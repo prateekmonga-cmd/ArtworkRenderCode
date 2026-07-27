@@ -176,8 +176,69 @@ def snap_coord(coord: float) -> float:
 # TEXT REPAIR
 # ═══════════════════════════════════════════════════════════════
 
+# Characters that appear when UTF-8 bytes are decoded as CP936/GBK: one CJK glyph
+# in place of each accented letter. Spanish and English artwork can never
+# legitimately contain these, so a run of them is always extractor damage.
+MOJIBAKE_RUN = re.compile(
+    r"[　-〿一-鿿豈-﫿＀-￯]+"
+)
+
+
+def is_plausible_artwork_char(ch: str) -> bool:
+    """True for characters that can legitimately appear in this artwork.
+
+    Latin letters and accents, punctuation, symbols such as the degree sign and
+    superscripts. Anything else (Cyrillic, Greek, CJK) means a mojibake candidate
+    decoded into noise rather than the Latin text that was lost.
+    """
+    cp = ord(ch)
+    return (
+        cp < 0x0250                    # ASCII, Latin-1, Latin Extended-A/B
+        or 0x2000 <= cp <= 0x20CF      # punctuation, superscripts, currency
+        or 0x2122 == cp                # trademark
+    )
+
+
+def repair_mojibake(text: str) -> tuple:
+    """Reverse UTF-8-decoded-as-GBK corruption.
+
+    "Composici<CJK>n" becomes "Composicion" with the accent restored, because the
+    CJK glyph carries the original UTF-8 bytes of the accented letter. Each run of
+    CJK characters is re-encoded to those bytes and decoded as UTF-8.
+
+    Runs that do not round-trip cleanly are left exactly as they were, so genuine
+    CJK text and unrecoverable damage (where the extractor already collapsed bytes
+    to U+FFFD) are never mangled further.
+
+    Returns (repaired, repairs).
+    """
+    if not MOJIBAKE_RUN.search(text):
+        return text, []
+
+    repairs = []
+
+    def fix(match):
+        run = match.group(0)
+        try:
+            candidate = run.encode("gbk").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return run
+        if not candidate or "�" in candidate:
+            return run
+        # A run can round-trip into something that is merely *valid* UTF-8 rather
+        # than the Latin text we lost (a lone CJK char decodes to Cyrillic, for
+        # instance). Only accept a candidate that is plausible artwork text.
+        if not all(is_plausible_artwork_char(ch) for ch in candidate):
+            return run
+        repairs.append({"from": run, "to": candidate, "type": "mojibake_gbk",
+                        "confidence": "high"})
+        return candidate
+
+    return MOJIBAKE_RUN.sub(fix, text), repairs
+
+
 def repair_text(text: str) -> tuple:
-    """Repair ligature corruption.
+    """Repair mojibake and ligature corruption.
 
     Returns (repaired, was_repaired, repairs, confidence) where confidence is:
       - None      -> text was untouched
@@ -186,12 +247,21 @@ def repair_text(text: str) -> tuple:
       - "guessed" -> the blanket U+FFFD->"ti" or soft-hyphen->"ti" fallback fired;
                      downstream should treat this text as unverified
     """
-    if '\ufffd' not in text and '\xad' not in text and '\ufb01' not in text and '\ufb02' not in text:
+    has_ligature_damage = ('\ufffd' in text or '\xad' in text
+                           or '\ufb01' in text or '\ufb02' in text)
+    has_mojibake = bool(MOJIBAKE_RUN.search(text))
+    if not has_ligature_damage and not has_mojibake:
         return text, False, [], None
 
     repairs = []
     repaired = text
     guessed = False
+
+    # 0. Mojibake first \u2014 the later steps must see real accented letters, and
+    #    KNOWN_CORRECTIONS keys are written in their accented form.
+    if has_mojibake:
+        repaired, mojibake_repairs = repair_mojibake(repaired)
+        repairs.extend(mojibake_repairs)
 
     # 1. Known word corrections (case-sensitive)
     for broken, fixed in KNOWN_CORRECTIONS.items():
