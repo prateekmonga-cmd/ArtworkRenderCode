@@ -1,3 +1,7 @@
+# Review notes, bug reports, and the test suites — not part of the deployed
+# service. The image only needs main.py, textrepair.py, and requirements.txt.
 suggest
+_test_*.py
+
 __pycache__/
 *.pyc
