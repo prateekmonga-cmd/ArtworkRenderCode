@@ -26,7 +26,8 @@ from textrepair import (
     PRODUCTION_MARK_TERMS, PRODUCTION_MARK_SHAPE, PRODUCTION_MARK_SUFFIX_MAX,
     KNOWN_CORRECTIONS, MOJIBAKE_RUN, is_plausible_artwork_char,
     repair_mojibake, repair_text, is_annotation, is_production_mark,
-    looks_like_production_mark, _normalize_for_ocr_compare,
+    looks_like_production_mark, is_dimension_near_miss,
+    _normalize_for_ocr_compare,
     direction_to_rotation, ROTATION_SOP,
     _within_one_edit, _find_component_type_end, _label_key,
 )
@@ -101,19 +102,6 @@ app = FastAPI(
     title="Artwork Compliance Extractor",
     description="Enhanced extraction with zone detection, rotation, and text repair",
     version="2.0.0"
-)
-
-from textrepair import (
-    PT_TO_MM, pt_to_mm, bbox_to_mm, rgb_to_hex, int_color_to_hex,
-    is_bold, is_italic, get_base_font_name, snap_size, snap_coord,
-    ANNOTATION_COLORS, ANNOTATION_RGB, ANNOTATION_COLOR_TOLERANCE,
-    is_annotation_color, DIMENSION_PATTERN, ARROW_CHARS,
-    PRODUCTION_MARK_TERMS, PRODUCTION_MARK_SHAPE, PRODUCTION_MARK_SUFFIX_MAX,
-    KNOWN_CORRECTIONS, MOJIBAKE_RUN, is_plausible_artwork_char,
-    repair_mojibake, repair_text, is_annotation, is_production_mark,
-    looks_like_production_mark, _normalize_for_ocr_compare,
-    direction_to_rotation, ROTATION_SOP,
-    _within_one_edit, _find_component_type_end, _label_key,
 )
 
 # Page slots are positional only. There is deliberately no name guess here:
@@ -458,7 +446,8 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                 # Near-miss: looks like a dimension marker but color not in
                 # ANNOTATION_COLORS — either a new annotation color we haven't
                 # added yet, or a real body-text dimension. Log + flag it.
-                if DIMENSION_PATTERN.match(repaired_text.strip()) and not is_annotation_color(color_hex):
+                # Header field values are exempt (see is_dimension_near_miss).
+                if is_dimension_near_miss(repaired_text, color_hex, in_header=in_header):
                     annotation_near_misses.append({
                         "text": repaired_text,
                         "color_hex": color_hex,
@@ -582,6 +571,74 @@ def extract_images(page: fitz.Page) -> list:
 # PAGE-LEVEL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
+# ─── Per-document colour profile ─────────────────────────────────
+# ANNOTATION_COLORS is a closed vocabulary tuned to one vendor's palette, and a
+# closed vocabulary is what caused B-01. Rather than enumerate every designer's
+# blue, look at how each colour is actually USED on this page: a colour carrying
+# several dimension callouts and no ordinary copy is a callout colour, whatever
+# its hex.
+#
+# This REPORTS the inference; it does not act on it. Auto-filtering on a guess
+# would delete artwork copy from a compliance review with no way to tell, and
+# the inference has not been validated against a second real artwork yet. Flip
+# ANNOTATION_COLOR_INFERENCE_ENFORCED once it has been.
+ANNOTATION_COLOR_INFERENCE_MIN_SPANS = 2
+ANNOTATION_COLOR_INFERENCE_ENFORCED = False
+
+
+def profile_span_colors(sections: dict) -> dict:
+    """Frequency of every colour on the page, and which unknown colours behave
+    like callout colours.
+
+    Returns the histogram (most used first) plus the inferred set, so a new
+    vendor's palette surfaces as data instead of silently passing through as
+    body text.
+    """
+    spans = sections.get("body", []) + sections.get("header_table", [])
+    counts = {}
+    dimension_only = {}
+
+    for s in spans:
+        color = (s.get("color_hex") or "").lower()
+        if not color:
+            continue
+        counts[color] = counts.get(color, 0) + 1
+        stats = dimension_only.setdefault(color, {"dimension": 0, "other": 0})
+        if DIMENSION_PATTERN.match(s.get("text", "").strip()):
+            stats["dimension"] += 1
+        else:
+            stats["other"] += 1
+
+    # Callouts filtered as annotations never reach body/header_table, so count
+    # them too — otherwise a correctly-detected colour looks unused here.
+    for a in sections.get("annotations", []):
+        color = (a.get("color_hex") or "").lower()
+        if color:
+            counts[color] = counts.get(color, 0) + 1
+
+    inferred = sorted(
+        color for color, stats in dimension_only.items()
+        if stats["dimension"] >= ANNOTATION_COLOR_INFERENCE_MIN_SPANS
+        and stats["other"] == 0
+        and not is_annotation_color(color)
+    )
+
+    for color in inferred:
+        logger.warning(
+            "Colour %s carries %d dimension spans and no body copy — it looks "
+            "like a callout colour missing from ANNOTATION_COLORS",
+            color, dimension_only[color]["dimension"],
+        )
+
+    return {
+        "histogram": [{"color_hex": c, "spans": n}
+                      for c, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "unknown_colors": sorted(c for c in counts if not is_annotation_color(c)),
+        "inferred_annotation_colors": inferred,
+        "inference_enforced": ANNOTATION_COLOR_INFERENCE_ENFORCED,
+    }
+
+
 def _detect_page_name_from_content(sections: dict, default_name: str) -> tuple:
     """Dynamically detect page name from 'Component Type' text spans.
 
@@ -648,9 +705,77 @@ HEADER_FIELD_LABELS = {
 }
 HEADER_MIN_LABELS = 2          # one stray phrase is not a header
 HEADER_FALLBACK_RATIO = 0.20   # top-of-page guess when content detection fails
-HEADER_PAD_PT = 6              # tolerance below the lowest matched label line
+HEADER_PAD_PT = 6              # tolerance below the lowest header row
+HEADER_ROW_PITCH_TOLERANCE = 1.8   # a row this far past the normal pitch ends the table
+HEADER_MAX_EXTENT_RATIO = 0.45     # never let the band swallow half the sheet
 
 
+def _median(values: list) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _grow_header_band(rows: list, seed_idx: list, height_pt: float) -> list:
+    """Extend a seed of matched label rows across the rest of the table.
+
+    The header is a table, and only some of its labels are in the vocabulary.
+    Stopping at the lowest *recognised* label left rows like "Size (W) | 60 mm"
+    below the split, in the body, where their dimension values were then logged
+    as annotation near-misses and forced needs_review on a clean page.
+
+    Rows are absorbed while they keep the table's row pitch and overlap it
+    horizontally; the first big vertical gap is the header/artwork boundary.
+    """
+    first, last = min(seed_idx), max(seed_idx)
+
+    # Row pitch measured from the matched rows themselves, so a dense header
+    # and an airy one each get their own gate rather than a fixed constant.
+    seed_tops = [rows[i]["bbox"][1] for i in seed_idx]
+    pitches = [b - a for a, b in zip(seed_tops, seed_tops[1:]) if b > a]
+    if pitches:
+        pitch = _median(pitches)
+    else:
+        heights = [rows[i]["bbox"][3] - rows[i]["bbox"][1] for i in seed_idx]
+        pitch = max(_median(heights) * 2, 1.0)
+    max_gap = pitch * HEADER_ROW_PITCH_TOLERANCE
+
+    def overlaps(idx, lo, hi):
+        b = rows[idx]["bbox"]
+        return b[0] <= hi and b[2] >= lo
+
+    band_x0 = min(rows[i]["bbox"][0] for i in seed_idx)
+    band_x1 = max(rows[i]["bbox"][2] for i in seed_idx)
+    ceiling = height_pt * HEADER_MAX_EXTENT_RATIO
+
+    # Downward: the common case — unrecognised field rows under the last label.
+    while last + 1 < len(rows):
+        nxt = rows[last + 1]
+        if nxt["bbox"][1] - rows[last]["bbox"][1] > max_gap:
+            break
+        if not overlaps(last + 1, band_x0, band_x1):
+            break
+        if nxt["bbox"][3] > ceiling:
+            break
+        last += 1
+        band_x0 = min(band_x0, nxt["bbox"][0])
+        band_x1 = max(band_x1, nxt["bbox"][2])
+
+    # Upward: a title or code row sitting above the first recognised label.
+    while first - 1 >= 0:
+        prev = rows[first - 1]
+        if rows[first]["bbox"][1] - prev["bbox"][1] > max_gap:
+            break
+        if not overlaps(first - 1, band_x0, band_x1):
+            break
+        first -= 1
+        band_x0 = min(band_x0, prev["bbox"][0])
+        band_x1 = max(band_x1, prev["bbox"][2])
+
+    return list(range(first, last + 1))
 
 
 def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
@@ -677,28 +802,35 @@ def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
         b[0], b[1] = min(b[0], x0), min(b[1], y0)
         b[2], b[3] = max(b[2], x1), max(b[3], y1)
 
-    matched_bboxes = []
+    # Sorted top-to-bottom so the band can grow over adjacent rows.
+    rows = sorted(lines.values(), key=lambda e: (e["bbox"][1], e["bbox"][0]))
+
+    seed_idx = []
     found_labels = set()
-    for entry in lines.values():
+    for i, entry in enumerate(rows):
         key = _label_key(" ".join(entry["words"]))
         hits = {canon for alias, canon in HEADER_FIELD_LABELS.items() if alias in key}
         if hits:
             found_labels |= hits
-            matched_bboxes.append(entry["bbox"])
+            seed_idx.append(i)
 
-    if len(found_labels) < HEADER_MIN_LABELS or not matched_bboxes:
+    if len(found_labels) < HEADER_MIN_LABELS or not seed_idx:
         return {
             "threshold_pt": fallback,
             "detected_by_content": False,
             "labels_found": sorted(found_labels),
+            "rows_in_band": 0, "unlabelled_rows_absorbed": 0,
             "bbox_mm": None, "width_mm": None, "height_mm": None,
             "vertical_position": None, "horizontal_position": None,
         }
 
-    x0 = min(b[0] for b in matched_bboxes)
-    y0 = min(b[1] for b in matched_bboxes)
-    x1 = max(b[2] for b in matched_bboxes)
-    y1 = max(b[3] for b in matched_bboxes)
+    band_idx = _grow_header_band(rows, seed_idx, height_pt)
+    band = [rows[i]["bbox"] for i in band_idx]
+
+    x0 = min(b[0] for b in band)
+    y0 = min(b[1] for b in band)
+    x1 = max(b[2] for b in band)
+    y1 = max(b[3] for b in band)
 
     page_w = page.rect.width or 1.0
     cx = (x0 + x1) / 2
@@ -717,6 +849,12 @@ def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
         "threshold_pt": min(y1 + HEADER_PAD_PT, height_pt),
         "detected_by_content": True,
         "labels_found": sorted(found_labels),
+        # How much of the band came from vocabulary hits vs. row-pitch growth.
+        # A high absorbed count means this artwork's field labels are mostly
+        # unknown to HEADER_FIELD_LABELS — worth a look before the vocabulary
+        # drifts further out of date.
+        "rows_in_band": len(band_idx),
+        "unlabelled_rows_absorbed": len(band_idx) - len(seed_idx),
         "bbox_mm": bbox_to_mm((x0, y0, x1, y1)),
         "width_mm": pt_to_mm(x1 - x0),
         "height_mm": pt_to_mm(y1 - y0),
@@ -835,6 +973,29 @@ def extract_page_data(page: fitz.Page, page_index: int,
     for z in zones:
         clean_zones.append({k: v for k, v in z.items() if k != "bbox_pt"})
 
+    color_profile = profile_span_colors(sections)
+
+    # Named reasons rather than one opaque boolean. Ordered most to least
+    # likely to mean the extraction itself is wrong, so a triage step can act
+    # on the first entry.
+    review_reasons = []
+    if unresolved_corruption_count > 0:
+        review_reasons.append("unresolved_corruption")
+    if ocr_info.get("ocr_skipped_reason"):
+        review_reasons.append("ocr_" + ocr_info["ocr_skipped_reason"])
+    if not header_region["detected_by_content"]:
+        # Everything positional downstream is a guess when this is set, so a
+        # near-miss reported alongside it is far more likely a false alarm.
+        review_reasons.append("header_not_detected")
+    if not page_name_detected:
+        review_reasons.append("page_name_not_detected")
+    if sections.get("annotation_near_misses"):
+        review_reasons.append("annotation_near_miss")
+    if sections.get("production_mark_near_misses"):
+        review_reasons.append("production_mark_near_miss")
+    if color_profile["inferred_annotation_colors"]:
+        review_reasons.append("unknown_annotation_color")
+
     return {
         "name": detected_name,
         "sections": sections,
@@ -847,6 +1008,9 @@ def extract_page_data(page: fitz.Page, page_index: int,
         "header_region": {
             k: v for k, v in header_region.items() if k != "threshold_pt"
         },
+        # How colour is actually used on this page, so a new vendor's callout
+        # palette surfaces as data instead of silently reading as body copy.
+        "color_profile": color_profile,
         "page_dimensions": {
             "width_pt": round(width_pt, 2),
             "height_pt": round(height_pt, 2),
@@ -867,6 +1031,8 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "rotated_elements_count": len(rotated_elements),
             "page_name_detected": page_name_detected,
             "header_detected_by_content": header_region["detected_by_content"],
+            "header_unlabelled_rows_absorbed": header_region.get("unlabelled_rows_absorbed", 0),
+            "inferred_annotation_colors": color_profile["inferred_annotation_colors"],
             "ocr_spans": ocr_info.get("ocr_spans", 0),
             "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
         },
@@ -883,14 +1049,12 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "header_detected_by_content": header_region["detected_by_content"],
             "ocr_available": TESSERACT_AVAILABLE,
             "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
-            "needs_review": (
-                unresolved_corruption_count > 0
-                or not page_name_detected
-                or not header_region["detected_by_content"]
-                or len(sections.get("annotation_near_misses", [])) > 0
-                or len(sections.get("production_mark_near_misses", [])) > 0
-                or ocr_info.get("ocr_skipped_reason") is not None
-            ),
+            # Why, not just whether. A near-miss on a page whose header was
+            # never located is a very different thing from one on a page that
+            # extracted cleanly, and collapsing both into a single boolean left
+            # the workflow no way to tell them apart.
+            "review_reasons": review_reasons,
+            "needs_review": bool(review_reasons),
         },
     }
 
@@ -969,6 +1133,12 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         for r in [p.get("extraction_confidence", {}).get("ocr_skipped_reason")]
         if r
     })
+    review_reasons = sorted({
+        r for p in result.values()
+        for r in p.get("extraction_confidence", {}).get("review_reasons", [])
+    })
+    if failed_pages:
+        review_reasons.insert(0, "page_extraction_failed")
     result["document_meta"] = {
         "filename": filename,
         "page_count": len([k for k in result if k.startswith("page")]),
@@ -978,14 +1148,15 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         "ocr_available": TESSERACT_AVAILABLE,
         "ocr_skip_reasons": ocr_skip_reasons,
         "extraction_seconds": elapsed,
+        "review_reasons": review_reasons,
         "needs_review": needs_review,
     }
     logger.info(
         "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d "
-        "ocr_skips=%s needs_review=%s elapsed=%.2fs",
+        "ocr_skips=%s needs_review=%s reasons=%s elapsed=%.2fs",
         filename or "<upload>", result["document_meta"]["page_count"],
         failed_pages, total_repairs, total_unresolved,
-        ocr_skip_reasons, needs_review, elapsed,
+        ocr_skip_reasons, needs_review, review_reasons, elapsed,
     )
     return result
 

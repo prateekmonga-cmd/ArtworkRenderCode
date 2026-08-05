@@ -363,6 +363,23 @@ def looks_like_production_mark(text: str, color_hex: str) -> bool:
     return not is_production_mark(stripped)
 
 
+def is_dimension_near_miss(text: str, color_hex: str, in_header: bool = False) -> bool:
+    """Dimension-shaped text in a colour we don't recognise as a callout.
+
+    The signal this exists to catch is a callout colour missing from
+    ANNOTATION_COLORS, or a stray dimension loose in the body. A dimension
+    inside the tabular header is neither — it is a declared field value
+    ("Size (W): 60 mm"), which is what a foil header is supposed to contain.
+    Without the in_header guard every such value logged a near-miss and forced
+    needs_review=True on a page that extracted perfectly.
+    """
+    if in_header:
+        return False
+    if not DIMENSION_PATTERN.match(text.strip()):
+        return False
+    return not is_annotation_color(color_hex)
+
+
 def _normalize_for_ocr_compare(text: str) -> str:
     """Normalize text for OCR-vs-repair comparison (whitespace/case tolerant)."""
     return re.sub(r'\s+', ' ', text).strip().lower()
