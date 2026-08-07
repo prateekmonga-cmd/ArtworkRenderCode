@@ -9,7 +9,11 @@ import math
 import re
 from typing import Any, Optional
 
-PT_TO_MM = 0.3528
+# Exact, not the rounded 0.3528 this used to hold. The rounded constant was
+# high by 0.0063%, so every measurement read slightly large — +0.022 mm on a
+# 350 mm insert. Below any artwork tolerance, but it was a systematic bias in
+# the one number every dimension check divides through.
+PT_TO_MM = 25.4 / 72
 
 
 def pt_to_mm(value: float) -> float:
@@ -74,7 +78,7 @@ def snap_coord(coord: float) -> float:
 
 # ─── Annotation detection ────────────────────────────────────
 ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8",
-                     "#196ea6", "#1a6ea6"}
+                     "#196ea6", "#1a6ea6", "#3373a8"}
 
 
 def _hex_to_rgb(h: str) -> tuple:
@@ -87,6 +91,12 @@ ANNOTATION_RGB = [_hex_to_rgb(c) for c in ANNOTATION_COLORS]
 # palette drift — #196ea6 vs #1a6ea6 (one hex digit) let 12 dimension callouts
 # through as body copy (B-01). Rich black (#231f20) header values stay far
 # outside this window.
+#
+# #3373a8 was listed rather than handled by widening the tolerance: it sits
+# exactly 25 away from #1a6ea6 on red, one unit past the window, so it near-
+# missed and 16 dimension callouts on Art-CommercialPDF-12168 were classified
+# as body copy. Bumping the tolerance to 25 would admit it, but widens the
+# window for every colour on every artwork to buy one palette entry.
 ANNOTATION_COLOR_TOLERANCE = 24
 
 
