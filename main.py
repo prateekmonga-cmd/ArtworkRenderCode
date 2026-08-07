@@ -863,6 +863,120 @@ def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
     }
 
 
+# The SOP writes the artwork code as one string, ACnnnV.n, but the tabular
+# header stores it as two separate fields. Anything that needs the whole value
+# had to join them itself, and did so inconsistently run to run ("AC2499V.10"
+# one time, "2499, 10" another), so a self-comparison failed on formatting
+# rather than on content. Synthesised once here instead; downstream reads
+# ac_reference and never rebuilds it.
+AC_COMPOSITE_RE = re.compile(r"\bAC\s*(\d+)\s*V\.?\s*(\d+)\b", re.IGNORECASE)
+
+# Row banding: spans whose vertical centres sit within this many points belong
+# to the same header row. Header rows in real artwork run ~14-20 pt apart, and
+# a value can be a couple of points off its label's baseline when font sizes
+# differ within the row.
+AC_ROW_BAND_PT = 6.0
+
+
+def _span_center_y(span: dict) -> float:
+    bbox = span.get("bbox") or [0, 0, 0, 0]
+    return (bbox[1] + bbox[3]) / 2
+
+
+def _value_for_label(header_table: list, canonical: str) -> Optional[str]:
+    """Find the value span sitting to the right of a header label.
+
+    Matched by position, not list order. header_table is appended in raw
+    PyMuPDF span order (unlike body, it is never sorted), so "the next item in
+    the list" is not reliably the value. The header is also two label/value
+    pairs wide -- "Product Name | ... | AC Reference | 2499" -- so the match has
+    to be the NEAREST span to the right within the same row, not the last one.
+    """
+    labels = [alias for alias, canon in HEADER_FIELD_LABELS.items()
+              if canon == canonical]
+
+    best_value = None
+    best_gap = None
+
+    for span in header_table:
+        key = _label_key(span.get("text", ""))
+        if not any(alias in key for alias in labels):
+            continue
+
+        # A merged cell can hold both label and value ("Version# 10"); prefer
+        # that reading when the label span itself carries trailing digits.
+        inline = re.search(r"(\d[\d.\-/]*)\s*$", span.get("text", "").strip())
+        if inline and _label_key(inline.group(1)) != key:
+            return inline.group(1)
+
+        label_bbox = span.get("bbox") or [0, 0, 0, 0]
+        label_mid = _span_center_y(span)
+
+        for other in header_table:
+            if other is span:
+                continue
+            other_bbox = other.get("bbox") or [0, 0, 0, 0]
+            if abs(_span_center_y(other) - label_mid) > AC_ROW_BAND_PT:
+                continue
+            gap = other_bbox[0] - label_bbox[2]
+            if gap < 0:                      # left of the label, not its value
+                continue
+            text = (other.get("text") or "").strip()
+            if not text:
+                continue
+            # Skip the next label in the same row (e.g. "AC Reference" sitting
+            # to the right of "Product Name") -- a label is never a value.
+            other_key = _label_key(text)
+            if any(alias in other_key for alias in HEADER_FIELD_LABELS):
+                continue
+            if best_gap is None or gap < best_gap:
+                best_gap, best_value = gap, text
+
+    return best_value
+
+
+def synthesize_ac_reference(header_table: list, body_text_all: str) -> dict:
+    """Combine the header's split AC Reference / Version fields into the single
+    canonical ACnnnV.n string, and report whether the same value appears
+    on-pack (rotated on a flap or edge, per the SOP).
+
+    consistent is None -- not False -- when either side is missing: absence of
+    an on-pack instance is a different finding from a genuine mismatch, and
+    collapsing them would make a missing value read as a contradiction.
+    """
+    ac_number = _value_for_label(header_table, "ac reference")
+    version_number = _value_for_label(header_table, "version")
+
+    # Guard against a neighbouring cell that is not the number we want.
+    if ac_number and not re.fullmatch(r"\d+", ac_number.strip()):
+        ac_number = None
+    if version_number and not re.fullmatch(r"[\d.]+", version_number.strip()):
+        version_number = None
+
+    header_combined = None
+    if ac_number and version_number:
+        header_combined = f"AC{ac_number.strip()}V.{version_number.strip()}"
+
+    on_pack_match = AC_COMPOSITE_RE.search(body_text_all or "")
+    on_pack_instance = on_pack_match.group(0).strip() if on_pack_match else None
+
+    consistent = None
+    if header_combined and on_pack_instance:
+        # Compared on digits alone: the on-pack instance is set in tiny rotated
+        # type where spacing round the "V." is unreliable, and a whitespace
+        # difference is not a content difference.
+        normalize = lambda s: re.sub(r"[^0-9a-z]", "", s.lower())
+        consistent = normalize(header_combined) == normalize(on_pack_instance)
+
+    return {
+        "header_combined": header_combined,
+        "ac_number": ac_number.strip() if ac_number else None,
+        "version": version_number.strip() if version_number else None,
+        "on_pack_instance": on_pack_instance,
+        "consistent": consistent,
+    }
+
+
 def extract_page_data(page: fitz.Page, page_index: int,
                       deadline: Optional[float] = None) -> dict:
     """Extract all data from a single page with enhanced features."""
@@ -1008,6 +1122,10 @@ def extract_page_data(page: fitz.Page, page_index: int,
         "header_region": {
             k: v for k, v in header_region.items() if k != "threshold_pt"
         },
+        # Canonical ACnnnV.n, synthesised once so no consumer re-derives it.
+        "ac_reference": synthesize_ac_reference(
+            sections["header_table"], body_text_all
+        ),
         # How colour is actually used on this page, so a new vendor's callout
         # palette surfaces as data instead of silently reading as body copy.
         "color_profile": color_profile,
