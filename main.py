@@ -226,8 +226,60 @@ ZONE_MIN_PANEL_PT = 20       # narrower than this is a gap, not a panel
 ZONE_Y_TOLERANCE_PT = 12     # spans may sit just outside the drawn artwork box
 
 
-def detect_zones(paths: list, header_threshold_pt: float) -> list:
+def _segment_vertical_xs(raw_drawings: list, header_threshold_pt: float,
+                         min_fold_h: float) -> set:
+    """Scan individual path items for vertical segments that are fold lines.
+
+    CorelDRAW typically exports the carton dieline as one compound path whose
+    overall rect spans the full carton width (>>3 pt), so the drawing-bbox scan
+    in detect_zones() never finds the constituent fold lines.  Inspecting
+    drawing["items"] catches them regardless of how they were grouped in the
+    source file (B-12).
+    """
+    xs: set = set()
+    for drawing in raw_drawings:
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        # Skip drawings whose entire bounding box is in the header band
+        if rect[3] <= header_threshold_pt:
+            continue
+        for item in drawing.get("items", []):
+            try:
+                itype = item[0]
+                if itype == "l":          # straight line segment
+                    p1, p2 = item[1], item[2]
+                    seg_x0 = min(p1.x, p2.x)
+                    seg_x1 = max(p1.x, p2.x)
+                    seg_y0 = min(p1.y, p2.y)
+                    seg_y1 = max(p1.y, p2.y)
+                    if (seg_x1 - seg_x0 < 3
+                            and seg_y1 - seg_y0 > min_fold_h
+                            and seg_y1 > header_threshold_pt):
+                        xs.add(round(seg_x0))
+                elif itype == "re":       # rectangle sub-item
+                    sr = item[1]          # fitz.Rect
+                    sw = abs(sr.x1 - sr.x0)
+                    sh = abs(sr.y1 - sr.y0)
+                    if (sw < 3 and sh > min_fold_h
+                            and sr.y1 > header_threshold_pt):
+                        xs.add(round(sr.x0))
+            except (IndexError, AttributeError, TypeError):
+                continue
+    return xs
+
+
+def detect_zones(paths: list, header_threshold_pt: float,
+                 raw_drawings: Optional[list] = None) -> list:
     """Detect panel zones from the artwork's vertical fold lines.
+
+    Two-pass approach:
+      Pass 1 — drawing bboxes (existing): catches fold lines drawn as individual
+               narrow paths (each fold line its own drawing object).
+      Pass 2 — drawing items (new): catches fold lines inside a compound path
+               whose overall bbox is wide.  CorelDRAW commonly exports all
+               dieline elements as one compound path, so pass 1 finds nothing
+               and pass 2 is the only route (B-12).
 
     The fold-line height test is measured against the artwork's own bounding
     box, not the sheet. A carton laid out on A4 has fold lines about 32 mm tall
@@ -247,23 +299,28 @@ def detect_zones(paths: list, header_threshold_pt: float) -> list:
     art_h = max(1.0, art_y1 - art_y0)
     min_fold_h = art_h * ZONE_MIN_FOLD_RATIO
 
-    vertical_lines = []
+    # Pass 1: drawing-bbox scan (narrow whole drawings = individual fold lines)
+    vertical_lines: set = set()
     for path in body_paths:
         x0, y0, x1, y1 = path.get("bbox_pt", [0, 0, 0, 0])
         width = abs(x1 - x0)
         height = abs(y1 - y0)
-
-        # Vertical fold line: narrow + tall relative to the artwork
         if width < 3 and height > min_fold_h:
-            vertical_lines.append(round(x0))
+            vertical_lines.add(round(x0))
 
-    vertical_lines = sorted(set(vertical_lines))
+    # Pass 2: item-level scan — compound path fold lines (B-12)
+    if len(vertical_lines) < 2 and raw_drawings:
+        vertical_lines |= _segment_vertical_xs(
+            raw_drawings, header_threshold_pt, min_fold_h
+        )
+
+    vertical_lines_sorted = sorted(vertical_lines)
 
     zones = []
-    if len(vertical_lines) >= 2:
+    if len(vertical_lines_sorted) >= 2:
         # Bound the panels by the artwork, not the sheet, so the reported
         # zone widths are the real panel widths a placement rule can check.
-        all_x = sorted(set([round(art_x0)] + vertical_lines + [round(art_x1)]))
+        all_x = sorted(set([round(art_x0)] + vertical_lines_sorted + [round(art_x1)]))
         for i in range(len(all_x) - 1):
             x_start, x_end = all_x[i], all_x[i + 1]
             if (x_end - x_start) < ZONE_MIN_PANEL_PT:
@@ -506,11 +563,16 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
             "production_mark_near_misses": production_mark_near_misses}
 
 
-def extract_paths_enhanced(page: fitz.Page) -> list:
-    """Extract paths with raw pt bbox for zone detection."""
+def extract_paths_enhanced(page: fitz.Page,
+                           raw_drawings: Optional[list] = None) -> list:
+    """Extract paths with raw pt bbox for zone detection.
+
+    Accepts pre-fetched raw_drawings to avoid a redundant get_drawings() call
+    when the caller already holds them (e.g. for segment-level fold detection).
+    """
     paths = []
     try:
-        drawings = page.get_drawings()
+        drawings = raw_drawings if raw_drawings is not None else page.get_drawings()
     except Exception:
         return paths
 
@@ -1242,11 +1304,16 @@ def extract_page_data(page: fitz.Page, page_index: int,
     header_region = detect_header_region(page, height_pt)
     header_threshold = header_region["threshold_pt"]
 
-    # 1. Paths first (zone detection needs them)
-    paths = extract_paths_enhanced(page)
+    # 1. Paths first (zone detection needs them). Fetch drawings once so both
+    # extract_paths_enhanced and detect_zones share the same call result —
+    # get_drawings() can be expensive on complex dieline art.
+    raw_drawings = page.get_drawings()
+    paths = extract_paths_enhanced(page, raw_drawings=raw_drawings)
 
-    # 2. Zone detection
-    zones = detect_zones(paths, header_threshold)
+    # 2. Zone detection — pass raw drawings so the item-level fold-line scan
+    # (B-12) can recover panels from compound paths where the overall bbox is
+    # too wide for the drawing-bbox pass to catch.
+    zones = detect_zones(paths, header_threshold, raw_drawings=raw_drawings)
 
     # 3. Text extraction — single pass; line_spacing is always computed and
     # stripped below for non-insert pages (no second full parse needed)
