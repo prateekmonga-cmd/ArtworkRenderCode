@@ -462,5 +462,14 @@ def _find_component_type_end(text: str) -> Optional[int]:
 
 
 def _label_key(text: str) -> str:
-    """Normalise a line for label matching: lowercase, strip punctuation."""
-    return re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+    """Normalise a line for label matching: lowercase, strip punctuation.
+
+    Runs of whitespace collapse to one space. Punctuation becomes a space, so
+    "Size (LxW)" used to key as "size  lxw" with two spaces -- one from each
+    parenthesis -- and never matched the "size lxw" alias. The declared
+    footprint was therefore unreadable on every component whose header spells
+    the field that way, which is labels and inserts; only the carton's
+    "Size in mm (LxWxH)" happened to land on a single space.
+    """
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^a-z0-9 ]+", " ", text.lower())).strip()

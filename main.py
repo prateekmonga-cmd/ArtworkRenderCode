@@ -702,6 +702,13 @@ HEADER_FIELD_LABELS = {
     "version": "version",
     "dimension": "dimension",
     "size in mm": "dimension",
+    # Cartons label this "Size in mm (LxWxH)", labels and inserts just
+    # "Size (LxW)" -- which matched nothing, so the declared footprint was
+    # unreadable on every component except the carton. Spelled out rather than
+    # adding a bare "size", which would also swallow "artwork size" and
+    # "flat size" (different canonicals, matched by substring).
+    "size lxw": "dimension",
+    "size lxwxh": "dimension",
 }
 HEADER_MIN_LABELS = 2          # one stray phrase is not a header
 HEADER_FALLBACK_RATIO = 0.20   # top-of-page guess when content detection fails
@@ -877,13 +884,19 @@ AC_COMPOSITE_RE = re.compile(r"\bAC\s*(\d+)\s*V\.?\s*(\d+)\b", re.IGNORECASE)
 # differ within the row.
 AC_ROW_BAND_PT = 6.0
 
+# Shapes the two header values must take. Passed into the lookup so a prose
+# neighbour is never selected in the first place.
+AC_NUMBER_SHAPE = re.compile(r"\d+")
+VERSION_SHAPE = re.compile(r"[\d.]+")
+
 
 def _span_center_y(span: dict) -> float:
     bbox = span.get("bbox") or [0, 0, 0, 0]
     return (bbox[1] + bbox[3]) / 2
 
 
-def _value_for_label(header_table: list, canonical: str) -> Optional[str]:
+def _value_for_label(header_table: list, canonical: str,
+                     shape: Optional[Any] = None) -> Optional[str]:
     """Find the value span sitting to the right of a header label.
 
     Matched by position, not list order. header_table is appended in raw
@@ -891,27 +904,47 @@ def _value_for_label(header_table: list, canonical: str) -> Optional[str]:
     the list" is not reliably the value. The header is also two label/value
     pairs wide -- "Product Name | ... | AC Reference | 2499" -- so the match has
     to be the NEAREST span to the right within the same row, not the last one.
+
+    A label can occur more than once on a page. When the header band over-grows
+    and absorbs body copy, an insert's own revision footer ("Version: AEMPS-
+    Medaxone 1 g-V2-mar2025") lands in header_table alongside the real header
+    field. Candidates are therefore resolved per label occurrence, topmost
+    first, rather than by taking the smallest gap across all occurrences --
+    that let the footer's neighbour, 18 pt away, outbid the genuine value
+    89 pt away and null the whole field.
+
+    shape is an optional compiled pattern the value must fullmatch. Applying it
+    during selection rather than afterwards means a prose neighbour is skipped
+    in favour of the real value, instead of winning and then being discarded.
     """
     labels = [alias for alias, canon in HEADER_FIELD_LABELS.items()
               if canon == canonical]
 
-    best_value = None
-    best_gap = None
+    def accepts(text: str) -> bool:
+        return shape is None or shape.fullmatch(text.strip()) is not None
 
-    for span in header_table:
+    # Header fields live in the header band at the top of the page; a body line
+    # repeating a field label always sits below it. Ties go to the higher span.
+    matches = [span for span in header_table
+               if any(alias in _label_key(span.get("text", ""))
+                      for alias in labels)]
+    matches.sort(key=lambda s: (s.get("bbox") or [0, 0, 0, 0])[1])
+
+    for span in matches:
         key = _label_key(span.get("text", ""))
-        if not any(alias in key for alias in labels):
-            continue
 
         # A merged cell can hold both label and value ("Version# 10"); prefer
         # that reading when the label span itself carries trailing digits.
         inline = re.search(r"(\d[\d.\-/]*)\s*$", span.get("text", "").strip())
-        if inline and _label_key(inline.group(1)) != key:
+        if (inline and _label_key(inline.group(1)) != key
+                and accepts(inline.group(1))):
             return inline.group(1)
 
         label_bbox = span.get("bbox") or [0, 0, 0, 0]
         label_mid = _span_center_y(span)
 
+        best_value = None
+        best_gap = None
         for other in header_table:
             if other is span:
                 continue
@@ -929,36 +962,120 @@ def _value_for_label(header_table: list, canonical: str) -> Optional[str]:
             other_key = _label_key(text)
             if any(alias in other_key for alias in HEADER_FIELD_LABELS):
                 continue
+            if not accepts(text):
+                continue
             if best_gap is None or gap < best_gap:
                 best_gap, best_value = gap, text
 
-    return best_value
+        if best_value is not None:
+            return best_value
+
+    return None
 
 
-def synthesize_ac_reference(header_table: list, body_text_all: str) -> dict:
+# How close to an edge the on-pack instance must sit to count as an edge
+# placement. The SOP requires this string on the right edge reading bottom-to-
+# top, so the rule needs the side, not just the coordinates.
+AC_EDGE_MARGIN_MM = 15.0
+
+
+def _artboard_bounds_mm(all_spans: list, page_w_mm: Optional[float],
+                        page_h_mm: Optional[float]) -> tuple:
+    """Extent of the drawn artboard, not the sheet it sits on.
+
+    The SOP's "right edge of the artboard" is the artwork's own edge. Artwork
+    is placed on an oversized sheet -- the insert measures 148x250 mm on a
+    250x350 mm page -- so measuring from the page put the rotated edge code
+    51 mm inside the "right" margin and classified it as interior.
+    """
+    xs = [s["bbox_mm"][2] for s in all_spans if s.get("bbox_mm")]
+    x0s = [s["bbox_mm"][0] for s in all_spans if s.get("bbox_mm")]
+    ys = [s["bbox_mm"][3] for s in all_spans if s.get("bbox_mm")]
+    y0s = [s["bbox_mm"][1] for s in all_spans if s.get("bbox_mm")]
+    if not xs:
+        return (0.0, 0.0, page_w_mm or 0.0, page_h_mm or 0.0)
+    return (min(x0s), min(y0s), max(xs), max(ys))
+
+
+def _edge_position(bbox_mm: list, bounds: tuple) -> Optional[str]:
+    """Which artboard edge a span sits against, or "interior"."""
+    if not bbox_mm or len(bbox_mm) < 4:
+        return None
+    x0, y0, x1, y1 = bbox_mm[:4]
+    bx0, by0, bx1, by1 = bounds
+    if bx1 - x1 <= AC_EDGE_MARGIN_MM:
+        return "right"
+    if x0 - bx0 <= AC_EDGE_MARGIN_MM:
+        return "left"
+    if y0 - by0 <= AC_EDGE_MARGIN_MM:
+        return "top"
+    if by1 - y1 <= AC_EDGE_MARGIN_MM:
+        return "bottom"
+    return "interior"
+
+
+def synthesize_ac_reference(header_table: list, body_text_all: str,
+                            all_spans: Optional[list] = None,
+                            page_w_mm: Optional[float] = None,
+                            page_h_mm: Optional[float] = None) -> dict:
     """Combine the header's split AC Reference / Version fields into the single
     canonical ACnnnV.n string, and report whether the same value appears
-    on-pack (rotated on a flap or edge, per the SOP).
+    on-pack (rotated on a flap or edge, per the SOP), including where.
 
     consistent is None -- not False -- when either side is missing: absence of
     an on-pack instance is a different finding from a genuine mismatch, and
     collapsing them would make a missing value read as a contradiction.
-    """
-    ac_number = _value_for_label(header_table, "ac reference")
-    version_number = _value_for_label(header_table, "version")
 
-    # Guard against a neighbouring cell that is not the number we want.
-    if ac_number and not re.fullmatch(r"\d+", ac_number.strip()):
-        ac_number = None
-    if version_number and not re.fullmatch(r"[\d.]+", version_number.strip()):
-        version_number = None
+    all_spans is every span on the page, whatever section it was filed under.
+    Searching body alone made this field depend on how the header band happened
+    to be drawn: on insert pages the band over-grew and absorbed the rotated
+    edge instance into header_table, so on_pack_instance came back null on
+    pages 3 and 4 of Art-CommercialPDF-12168 while pages 1 and 2 resolved it.
+    The code is printed on the pack either way; which bucket the band sorted it
+    into is an extraction detail and must not change the finding.
+
+    The matched span's coordinates and rotation are reported alongside, so a
+    rule checking placement ("right edge, 90 CCW") reads a measured field
+    instead of re-scanning spans it may not find.
+    """
+    ac_number = _value_for_label(header_table, "ac reference", AC_NUMBER_SHAPE)
+    version_number = _value_for_label(header_table, "version", VERSION_SHAPE)
 
     header_combined = None
     if ac_number and version_number:
         header_combined = f"AC{ac_number.strip()}V.{version_number.strip()}"
 
-    on_pack_match = AC_COMPOSITE_RE.search(body_text_all or "")
-    on_pack_instance = on_pack_match.group(0).strip() if on_pack_match else None
+    # Span-level first, so position and rotation come with the match. Header
+    # label/value cells are skipped -- the header's own declaration is not an
+    # on-pack instance of it, or every page would trivially "match itself".
+    on_pack_instance = None
+    on_pack_position = None
+    bounds = _artboard_bounds_mm(all_spans or [], page_w_mm, page_h_mm)
+    label_ids = {id(s) for s in (header_table or [])
+                 if _label_key(s.get("text", "")) in HEADER_FIELD_LABELS}
+    for span in (all_spans or []):
+        if id(span) in label_ids:
+            continue
+        match = AC_COMPOSITE_RE.search(span.get("text") or "")
+        if not match:
+            continue
+        bbox_mm = span.get("bbox_mm")
+        on_pack_instance = match.group(0).strip()
+        on_pack_position = {
+            "bbox_mm": bbox_mm,
+            "rotation_deg": span.get("rotation_deg"),
+            "rotation_sop": span.get("rotation_sop"),
+            "edge": _edge_position(bbox_mm, bounds),
+            "artboard_bounds_mm": [round(v, 2) for v in bounds],
+            "font_size_pt": span.get("font_size_pt"),
+        }
+        break
+
+    # Fall back to the concatenated text: the composite can be split across
+    # spans, which the per-span scan above cannot see. No position then.
+    if on_pack_instance is None:
+        text_match = AC_COMPOSITE_RE.search(body_text_all or "")
+        on_pack_instance = text_match.group(0).strip() if text_match else None
 
     consistent = None
     if header_combined and on_pack_instance:
@@ -973,6 +1090,142 @@ def synthesize_ac_reference(header_table: list, body_text_all: str) -> dict:
         "ac_number": ac_number.strip() if ac_number else None,
         "version": version_number.strip() if version_number else None,
         "on_pack_instance": on_pack_instance,
+        "on_pack_position": on_pack_position,
+        "consistent": consistent,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DIMENSION CROSS-CHECK
+# ═══════════════════════════════════════════════════════════════
+#
+# Three independent sources state the component's size and nothing compared
+# them: the header's declared field ("38x38x67 mm"), the printed callouts
+# ("38.00 mm"), and the drawn geometry. The callouts are read as text, not
+# measured, so on their own they verify nothing -- a drawing that says 38 mm
+# while measuring 42 mm read as perfectly consistent. Cross-checked here once,
+# for the same reason ac_reference is: so no consumer re-derives it and gets a
+# different answer each run.
+
+DIMENSION_TOLERANCE_MM = 0.5      # print tolerance; observed error is ~0.02 mm
+SHEET_TOLERANCE_MM = 1.0          # a rect this close to the page IS the sheet
+
+# Declared footprints are written "38x38x67 mm", "70x30mm", "148x250mm".
+DIMENSION_VALUE_SHAPE = re.compile(
+    r"[\d.]+(?:\s*[x×]\s*[\d.]+){1,2}\s*(?:mm)?", re.IGNORECASE)
+DIMENSION_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _dimension_numbers(text: Optional[str]) -> list:
+    return [float(n) for n in DIMENSION_NUMBER_RE.findall(text or "")]
+
+
+def _component_rects(paths: list, page_w_mm: float, page_h_mm: float) -> list:
+    """Drawn rectangles that could be a component outline.
+
+    The sheet rect is dropped -- every page carries one and it would match a
+    declared size only by coincidence. Everything else is kept: matching is
+    done on whole rects, not on edge lengths, because edges are not
+    discriminating (page 1 has 37 distinct edge lengths, so a declared value
+    finds a match by chance; it has only a handful of distinct large rects).
+    """
+    rects = []
+    for path in paths:
+        bbox = path.get("bbox_mm")
+        if not bbox:
+            continue
+        width = round(bbox[2] - bbox[0], 2)
+        height = round(bbox[3] - bbox[1], 2)
+        if width <= 0 or height <= 0:
+            continue
+        if (abs(width - page_w_mm) <= SHEET_TOLERANCE_MM
+                and abs(height - page_h_mm) <= SHEET_TOLERANCE_MM):
+            continue
+        rects.append((width, height))
+    return rects
+
+
+def _match_rect(rects: list, side_a: float, side_b: float) -> Optional[dict]:
+    """Closest drawn rect to a declared side pair, in either orientation."""
+    best = None
+    for width, height in rects:
+        for candidate in ((width, height), (height, width)):
+            delta = max(abs(candidate[0] - side_a), abs(candidate[1] - side_b))
+            if delta <= DIMENSION_TOLERANCE_MM and (best is None
+                                                    or delta < best["delta_mm"]):
+                best = {"measured_mm": [width, height],
+                        "delta_mm": round(delta, 3)}
+    return best
+
+
+def synthesize_dimension_check(header_table: list, annotations: list,
+                               near_misses: list, paths: list,
+                               page_w_mm: float, page_h_mm: float) -> dict:
+    """Reconcile declared size, printed callouts, and drawn geometry.
+
+    consistent is None -- not False -- when a source is missing, matching
+    ac_reference's contract: an unmeasurable page is not a failing page.
+    """
+    declared_raw = _value_for_label(header_table, "dimension",
+                                    DIMENSION_VALUE_SHAPE)
+    declared = _dimension_numbers(declared_raw)
+
+    # Callouts normally arrive as classified annotations. On an unknown vendor
+    # palette they land in near-misses instead; read those rather than let the
+    # whole check go quiet on a colour we simply haven't seen before.
+    callout_source = "annotations"
+    spans = [a for a in annotations
+             if DIMENSION_PATTERN.match((a.get("text") or "").strip())]
+    if not spans:
+        spans = [a for a in near_misses
+                 if DIMENSION_PATTERN.match((a.get("text") or "").strip())]
+        callout_source = "annotation_near_misses" if spans else None
+    callouts = sorted({v for s in spans
+                       for v in _dimension_numbers(s.get("text"))})
+
+    rects = _component_rects(paths, page_w_mm, page_h_mm)
+
+    # Every distinct pair of declared sides should be drawn somewhere: a
+    # 38x38x67 carton shows a 38x67 face and a 38x38 face.
+    pairs = sorted({(min(a, b), max(a, b))
+                    for i, a in enumerate(declared)
+                    for b in declared[i + 1:]})
+    pair_results = []
+    for side_a, side_b in pairs:
+        match = _match_rect(rects, side_a, side_b)
+        pair_results.append({
+            "declared_mm": [side_a, side_b],
+            "matched": match is not None,
+            "measured_mm": match["measured_mm"] if match else None,
+            "delta_mm": match["delta_mm"] if match else None,
+        })
+
+    measured_ok = None
+    if pairs and rects:
+        measured_ok = all(p["matched"] for p in pair_results)
+
+    unmatched_callouts = [c for c in callouts
+                          if not any(abs(c - d) <= DIMENSION_TOLERANCE_MM
+                                     for d in declared)]
+    callouts_ok = None
+    if declared and callouts:
+        callouts_ok = not unmatched_callouts
+
+    consistent = None
+    if measured_ok is not None or callouts_ok is not None:
+        consistent = all(flag for flag in (measured_ok, callouts_ok)
+                         if flag is not None)
+
+    return {
+        "declared_raw": declared_raw,
+        "declared_mm": declared or None,
+        "callouts_mm": callouts or None,
+        "callout_source": callout_source,
+        "measured_pairs": pair_results,
+        "declared_vs_measured": measured_ok,
+        "declared_vs_callouts": callouts_ok,
+        "unmatched_callouts_mm": unmatched_callouts or None,
+        "tolerance_mm": DIMENSION_TOLERANCE_MM,
         "consistent": consistent,
     }
 
@@ -1123,8 +1376,20 @@ def extract_page_data(page: fitz.Page, page_index: int,
             k: v for k, v in header_region.items() if k != "threshold_pt"
         },
         # Canonical ACnnnV.n, synthesised once so no consumer re-derives it.
+        # Every section is passed, not just body: the on-pack instance is on the
+        # pack regardless of which bucket the header band sorted it into.
         "ac_reference": synthesize_ac_reference(
-            sections["header_table"], body_text_all
+            sections["header_table"], body_text_all,
+            all_spans=(sections["body"] + sections["header_table"]
+                       + sections["annotations"]
+                       + sections.get("annotation_near_misses", [])),
+            page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
+        ),
+        # Declared size vs printed callouts vs drawn geometry, reconciled once.
+        "dimension_check": synthesize_dimension_check(
+            sections["header_table"], sections["annotations"],
+            sections.get("annotation_near_misses", []), clean_paths,
+            pt_to_mm(width_pt), pt_to_mm(height_pt),
         ),
         # How colour is actually used on this page, so a new vendor's callout
         # palette surfaces as data instead of silently reading as body copy.
