@@ -5,3 +5,5 @@ _test_*.py
 
 __pycache__/
 *.pyc
+
+CUsersparas_code_raw_utf8.txt
