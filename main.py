@@ -24,7 +24,7 @@ from textrepair import (
     ANNOTATION_COLORS, ANNOTATION_RGB, ANNOTATION_COLOR_TOLERANCE,
     is_annotation_color, DIMENSION_PATTERN, ARROW_CHARS,
     PRODUCTION_MARK_TERMS, PRODUCTION_MARK_SHAPE, PRODUCTION_MARK_SUFFIX_MAX,
-    KNOWN_CORRECTIONS, MOJIBAKE_RUN, is_plausible_artwork_char,
+    KNOWN_CORRECTIONS, is_plausible_artwork_char,
     repair_mojibake, repair_text, is_annotation, is_production_mark,
     looks_like_production_mark, is_dimension_near_miss,
     _normalize_for_ocr_compare,
@@ -454,16 +454,6 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                     color_hex = rgb_to_hex(color)
 
                 repaired_text, was_repaired, repair_log, corruption_confidence = repair_text(raw_text)
-
-                # TEMPORARY DEBUG (remove after diagnosing the "贸" mojibake
-                # case): log raw vs repaired bytes for any span PyMuPDF handed
-                # back with non-ASCII chars, so we can see server-side what
-                # repair_text() actually received and returned.
-                if any(ord(ch) > 127 for ch in raw_text):
-                    logger.warning(
-                        "MOJIBAKE_DEBUG raw=%r repaired=%r mojibake_run_match=%r repair_log=%r",
-                        raw_text, repaired_text, bool(MOJIBAKE_RUN.search(raw_text)), repair_log,
-                    )
 
                 # NOTE: OCR for guessed repairs happens in ocr_guessed_spans()
                 # as a bounded post-pass — never per-span in this hot loop.
@@ -1644,7 +1634,13 @@ async def extract_pdf(file: UploadFile = File(...), render: bool = False,
         result = await run_in_threadpool(
             extract_artwork, pdf_bytes, file.filename, render, render_dpi
         )
-        return JSONResponse(content=result)
+        # Explicit charset: some HTTP clients (n8n's HTTP Request node
+        # included) don't honour RFC 8259's "JSON is always UTF-8" and
+        # sniff/guess the response encoding when Content-Type omits it —
+        # observed decoding this body as GBK, turning "ó" into a CJK
+        # character (U+8D38) despite the bytes on the wire being correct
+        # UTF-8. Naming the charset removes the ambiguity outright.
+        return JSONResponse(content=result, media_type="application/json; charset=utf-8")
     except Exception as e:
         logger.exception(f"Extraction failed for {file.filename}")
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
@@ -1786,7 +1782,7 @@ async def extract_gpmi(file: UploadFile = File(...)):
             "text": indexed_text,
             "fileName": clean_name,
             "fileType": "pdf",
-        })
+        }, media_type="application/json; charset=utf-8")
     except HTTPException:
         raise
     except Exception as e:
