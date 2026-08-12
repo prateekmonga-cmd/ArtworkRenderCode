@@ -18,6 +18,20 @@ from fastapi.concurrency import run_in_threadpool
 from typing import Any, Optional
 from playwright.async_api import async_playwright
 
+from textrepair import (
+    PT_TO_MM, pt_to_mm, bbox_to_mm, rgb_to_hex, int_color_to_hex,
+    is_bold, is_italic, get_base_font_name, snap_size, snap_coord,
+    ANNOTATION_COLORS, ANNOTATION_RGB, ANNOTATION_COLOR_TOLERANCE,
+    is_annotation_color, DIMENSION_PATTERN, ARROW_CHARS,
+    PRODUCTION_MARK_TERMS, PRODUCTION_MARK_SHAPE, PRODUCTION_MARK_SUFFIX_MAX,
+    KNOWN_CORRECTIONS, MOJIBAKE_RUN, is_plausible_artwork_char,
+    repair_mojibake, repair_text, is_annotation, is_production_mark,
+    looks_like_production_mark, is_dimension_near_miss,
+    _normalize_for_ocr_compare,
+    direction_to_rotation, ROTATION_SOP,
+    _within_one_edit, _find_component_type_end, _label_key,
+)
+
 logger = logging.getLogger("artwork-extractor")
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -26,18 +40,28 @@ if not logging.getLogger().handlers:
     )
 
 # ─── Optional OCR support (graceful degrade if tesseract missing) ───
+# OCR is what confirms a guessed ligature repair. Without it every guessed span
+# stays unresolved and both pages come back needs_review=True on every run — a
+# deployment difference, not a data difference. So say so loudly at startup
+# rather than leaving it to be inferred from the output (B-09).
+_OCR_BANNER = (
+    "OCR UNAVAILABLE (%s). Ligature repairs cannot be confirmed; pages with "
+    "guessed corrections will report needs_review=True. Install tesseract-ocr "
+    "and the tesseract-ocr-spa language pack in the deployment image."
+)
+
 try:
     import pytesseract
     from PIL import Image
     try:
         pytesseract.get_tesseract_version()
         TESSERACT_AVAILABLE = True
-    except Exception:
+    except Exception as _e:
         TESSERACT_AVAILABLE = False
-        logger.warning("pytesseract installed but tesseract binary not found — OCR fallback disabled")
-except ImportError:
+        logger.error(_OCR_BANNER, f"tesseract binary not found: {_e}")
+except ImportError as _e:
     TESSERACT_AVAILABLE = False
-    logger.warning("pytesseract/Pillow not installed — OCR fallback disabled")
+    logger.error(_OCR_BANNER, f"pytesseract/Pillow not installed: {_e}")
 
 _ocr_lang = None
 
@@ -49,9 +73,25 @@ def get_ocr_lang() -> str:
         try:
             if "spa" in pytesseract.get_languages(config=""):
                 _ocr_lang = "spa+eng"
-        except Exception:
-            pass
+            else:
+                logger.error(
+                    "OCR language pack 'spa' is MISSING — Spanish artwork will be "
+                    "read with the English model, so accented characters will be "
+                    "misread and repairs may be wrongly marked ocr_disagreement. "
+                    "Install tesseract-ocr-spa."
+                )
+        except Exception as e:
+            logger.warning("Could not list tesseract languages (%s); defaulting to eng", e)
     return _ocr_lang
+
+
+def log_ocr_status() -> None:
+    """Report the OCR posture once, at app startup, at a level that shows up."""
+    if TESSERACT_AVAILABLE:
+        logger.info("OCR available: tesseract %s, languages=%s",
+                    pytesseract.get_tesseract_version(), get_ocr_lang())
+    else:
+        logger.error(_OCR_BANNER, "see startup import errors above")
 
 # Global browser instance (reused across requests)
 _playwright = None
@@ -64,15 +104,14 @@ app = FastAPI(
     version="2.0.0"
 )
 
-PT_TO_MM = 0.3528
-
-PAGE_CONFIG = {
-    0: {"key": "page1", "name": "outer carton"},
-    1: {"key": "page2", "name": "sticker label"},
-    2: {"key": "page3", "name": "insert front"},
-    3: {"key": "page4", "name": "insert back"},
-}
-SKIP_PAGES = []  # Removed hardcoded [4] to allow processing all pages
+# Page slots are positional only. There is deliberately no name guess here:
+# the old table called page 2 a "sticker label" when this artwork's page 2 is a
+# foil, and that guess flowed into is_insert, which decides whether
+# line_spacing survives. Content detection supplies the real name; when it
+# fails, "page N" says so honestly (B-11).
+def page_slot(page_index: int) -> dict:
+    n = page_index + 1
+    return {"key": f"page{n}", "name": f"page {n}"}
 
 # ─── OCR performance bounds ──────────────────────────────────
 # OCR is a targeted fallback, not a bulk pass. A page riddled with corrupt
@@ -82,249 +121,6 @@ OCR_DPI = 200                     # 200 DPI: ~20px glyphs on 6-7pt pharma print 
 OCR_SPAN_CAP = 15                 # >this many guessed spans on a page → skip OCR, flag page
 OCR_MAX_WORKERS = 4               # bounded parallel Tesseract calls (Render CPU is small)
 EXTRACTION_TIME_BUDGET_S = 120    # wall-clock guard: degrade gracefully, never 502
-
-# ─── Annotation detection ────────────────────────────────────
-ANNOTATION_COLORS = {"#0000ff", "#0000cd", "#0054a6", "#0091d2", "#1a73e8", "#196ea6"}
-DIMENSION_PATTERN = re.compile(r'^\s*[\d.]+\s*mm\s*$', re.IGNORECASE)
-ARROW_CHARS = {'◄', '►', '▲', '▼', '←', '→', '↑', '↓', '◀', '▶'}
-
-# ─── Print-production marks ──────────────────────────────────
-# Instructions addressed to the printer, not copy addressed to the patient:
-# "Pasting Side", "Stereo print", varnish and die-line callouts. They are on the
-# artwork file but not on the finished pack, so they are not artwork content and
-# must not be judged as such — they are the reason rule 1-1 reported an Arial
-# font violation and rule 1-18 reported English words on Spanish artwork.
-#
-# Matched as whole spans only. A production term appearing inside a real sentence
-# is left alone; these marks always sit in their own span.
-PRODUCTION_MARK_TERMS = {
-    "pasting side", "stereo print", "stereo", "die line", "dieline", "die cut",
-    "cut line", "cutline", "crease line", "fold line", "bleed line", "trim line",
-    "varnish", "varnish free", "no varnish", "matt varnish", "gloss varnish",
-    "spot uv", "overprint", "emboss", "debossing", "hot foil", "foil stamp",
-    "kiss cut", "tuck flap", "glue flap", "gusset", "artwork size", "flat size",
-    "print side", "reverse side", "inner side", "outer side", "non printing area",
-    "not to scale", "scale 1:1", "colour code", "color code", "pantone", "cmyk",
-}
-# A short standalone English phrase set in the annotation palette is the shape a
-# production mark takes. Anything matching that shape but absent from the
-# vocabulary is logged as a near-miss so new terms surface instead of silently
-# becoming compliance failures — same contract as annotation_near_misses.
-PRODUCTION_MARK_SHAPE = re.compile(r'^[A-Za-z][A-Za-z0-9 .:/\-]{2,28}$')
-
-# ─── Ligature repair ─────────────────────────────────────────
-KNOWN_CORRECTIONS = {
-    'con\ufffdene': 'contiene', 'Con\ufffdene': 'Contiene',
-    'pharmaceu\ufffdcals': 'pharmaceuticals', 'Pharmaceu\ufffdcals': 'Pharmaceuticals',
-    'úl\ufffdmo': 'último', 'e\ufffdqueta': 'etiqueta',
-    'me\ufffdlo': 'metilo', 'ac\ufffdvo': 'activo', 'ac\ufffdva': 'activa',
-    'an\ufffdhelmín\ufffdco': 'antihelmíntico', 'Vida ú\ufffdl': 'Vida útil',
-    'sus\ufffdtución': 'sustitución', 'garan\ufffdza': 'garantiza',
-    'iden\ufffdficar': 'identificar', 'inves\ufffdgar': 'investigar',
-    'efe\ufffdvos': 'efectivos', 'Ges\ufffdón': 'Gestión',
-    'can\ufffddad': 'cantidad', 'repe\ufffdr': 'repetir',
-    'par\ufffdcular': 'particular', 'compa\ufffdble': 'compatible',
-    'mul\ufffdplicar': 'multiplicar', 'alterna\ufffdva': 'alternativa',
-    'Alterna\ufffdva': 'Alternativa', 'obje\ufffdvo': 'objetivo',
-    'sen\ufffddo': 'sentido', 'intes\ufffdnal': 'intestinal',
-    'Intes\ufffdnal': 'Intestinal', 'adver\ufffdda': 'advertida',
-    'sor\ufffdtol': 'sorbitol', 'Sor\ufffdtol': 'Sorbitol',
-}
-
-
-# ═══════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════
-
-def pt_to_mm(value: float) -> float:
-    return round(value * PT_TO_MM, 2)
-
-def bbox_to_mm(bbox) -> list:
-    return [pt_to_mm(v) for v in bbox]
-
-def rgb_to_hex(color: Any) -> str:
-    if color is None:
-        return "#000000"
-    if isinstance(color, (int, float)):
-        val = int(color * 255)
-        return f"#{val:02x}{val:02x}{val:02x}"
-    if len(color) == 1:
-        val = int(color[0] * 255)
-        return f"#{val:02x}{val:02x}{val:02x}"
-    if len(color) == 3:
-        r, g, b = [int(c * 255) for c in color]
-        return f"#{r:02x}{g:02x}{b:02x}"
-    if len(color) == 4:
-        c_val, m, y, k = color
-        r = int(255 * (1 - c_val) * (1 - k))
-        g = int(255 * (1 - m) * (1 - k))
-        b = int(255 * (1 - y) * (1 - k))
-        return f"#{r:02x}{g:02x}{b:02x}"
-    return "#000000"
-
-def int_color_to_hex(color: int) -> str:
-    r = (color >> 16) & 0xFF
-    g = (color >> 8) & 0xFF
-    b = color & 0xFF
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-def is_bold(font_name: str, flags: int) -> bool:
-    if flags & (1 << 18):
-        return True
-    bold_patterns = ["bold", "black", "heavy", "demi", "semibold", "extrabold"]
-    return any(p in font_name.lower() for p in bold_patterns)
-
-def is_italic(font_name: str, flags: int) -> bool:
-    if flags & (1 << 6):
-        return True
-    return any(p in font_name.lower() for p in ["italic", "oblique", "slant"])
-
-def get_base_font_name(font_name: str) -> str:
-    name = font_name
-    if "+" in name:
-        name = name.split("+")[-1]
-    for suffix in ["-Bold", "-Italic", "-BoldItalic", "-Regular",
-                   "Bold", "Italic", "Regular", "Light", "Medium",
-                   "-MT", "MT", "-PS", "PS"]:
-        name = name.replace(suffix, "")
-    return name.strip()
-
-def snap_size(size: float, precision: float = 0.5) -> float:
-    return round(size / precision) * precision
-
-def snap_coord(coord: float) -> float:
-    return round(coord)
-
-
-# ═══════════════════════════════════════════════════════════════
-# TEXT REPAIR
-# ═══════════════════════════════════════════════════════════════
-
-# Characters that appear when UTF-8 bytes are decoded as CP936/GBK: one CJK glyph
-# in place of each accented letter. Spanish and English artwork can never
-# legitimately contain these, so a run of them is always extractor damage.
-MOJIBAKE_RUN = re.compile(
-    r"[　-〿一-鿿豈-﫿＀-￯]+"
-)
-
-
-def is_plausible_artwork_char(ch: str) -> bool:
-    """True for characters that can legitimately appear in this artwork.
-
-    Latin letters and accents, punctuation, symbols such as the degree sign and
-    superscripts. Anything else (Cyrillic, Greek, CJK) means a mojibake candidate
-    decoded into noise rather than the Latin text that was lost.
-    """
-    cp = ord(ch)
-    return (
-        cp < 0x0250                    # ASCII, Latin-1, Latin Extended-A/B
-        or 0x2000 <= cp <= 0x20CF      # punctuation, superscripts, currency
-        or 0x2122 == cp                # trademark
-    )
-
-
-def repair_mojibake(text: str) -> tuple:
-    """Reverse UTF-8-decoded-as-GBK corruption.
-
-    "Composici<CJK>n" becomes "Composicion" with the accent restored, because the
-    CJK glyph carries the original UTF-8 bytes of the accented letter. Each run of
-    CJK characters is re-encoded to those bytes and decoded as UTF-8.
-
-    Runs that do not round-trip cleanly are left exactly as they were, so genuine
-    CJK text and unrecoverable damage (where the extractor already collapsed bytes
-    to U+FFFD) are never mangled further.
-
-    Returns (repaired, repairs).
-    """
-    if not MOJIBAKE_RUN.search(text):
-        return text, []
-
-    repairs = []
-
-    def fix(match):
-        run = match.group(0)
-        try:
-            candidate = run.encode("gbk").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return run
-        if not candidate or "�" in candidate:
-            return run
-        # A run can round-trip into something that is merely *valid* UTF-8 rather
-        # than the Latin text we lost (a lone CJK char decodes to Cyrillic, for
-        # instance). Only accept a candidate that is plausible artwork text.
-        if not all(is_plausible_artwork_char(ch) for ch in candidate):
-            return run
-        repairs.append({"from": run, "to": candidate, "type": "mojibake_gbk",
-                        "confidence": "high"})
-        return candidate
-
-    return MOJIBAKE_RUN.sub(fix, text), repairs
-
-
-def repair_text(text: str) -> tuple:
-    """Repair mojibake and ligature corruption.
-
-    Returns (repaired, was_repaired, repairs, confidence) where confidence is:
-      - None      -> text was untouched
-      - "high"    -> only known/validated corrections applied (KNOWN_CORRECTIONS,
-                     standard fi/fl ligatures, soft-hyphen removal)
-      - "guessed" -> the blanket U+FFFD->"ti" or soft-hyphen->"ti" fallback fired;
-                     downstream should treat this text as unverified
-    """
-    has_ligature_damage = ('\ufffd' in text or '\xad' in text
-                           or '\ufb01' in text or '\ufb02' in text)
-    has_mojibake = bool(MOJIBAKE_RUN.search(text))
-    if not has_ligature_damage and not has_mojibake:
-        return text, False, [], None
-
-    repairs = []
-    repaired = text
-    guessed = False
-
-    # 0. Mojibake first \u2014 the later steps must see real accented letters, and
-    #    KNOWN_CORRECTIONS keys are written in their accented form.
-    if has_mojibake:
-        repaired, mojibake_repairs = repair_mojibake(repaired)
-        repairs.extend(mojibake_repairs)
-
-    # 1. Known word corrections (case-sensitive)
-    for broken, fixed in KNOWN_CORRECTIONS.items():
-        if broken in repaired:
-            repaired = repaired.replace(broken, fixed)
-            repairs.append({"from": broken, "to": fixed, "type": "known_word",
-                            "confidence": "high"})
-
-    # 2. Remaining U+FFFD → assume "ti" ligature (dominant in pharma fonts)
-    if '\ufffd' in repaired:
-        repaired = repaired.replace('\ufffd', 'ti')
-        repairs.append({"from": "U+FFFD", "to": "ti", "type": "ligature_ti",
-                        "confidence": "guessed"})
-        guessed = True
-
-    # 3. Soft hyphens — only replace with 'ti' when between letters (ligature artifact)
-    if '\xad' in repaired:
-        # Only replace \xad when it sits between two word characters (ligature gap)
-        new_text = re.sub(r'(?<=\w)\xad(?=\w)', 'ti', repaired)
-        if new_text != repaired:
-            repairs.append({"from": "U+00AD", "to": "ti", "type": "soft_hyphen_ligature",
-                            "confidence": "guessed"})
-            repaired = new_text
-            guessed = True
-        else:
-            # Standalone soft hyphen — just remove it
-            repaired = repaired.replace('\xad', '')
-            repairs.append({"from": "U+00AD", "to": "", "type": "soft_hyphen_removed",
-                            "confidence": "high"})
-
-    # 4. Standard ligature chars
-    for lig, rep in {'\ufb01': 'fi', '\ufb02': 'fl'}.items():
-        if lig in repaired:
-            repaired = repaired.replace(lig, rep)
-            repairs.append({"from": f"U+{ord(lig):04X}", "to": rep, "type": "ligature",
-                            "confidence": "high"})
-
-    confidence = "guessed" if guessed else ("high" if repairs else None)
-    return repaired, len(repairs) > 0, repairs, confidence
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -420,125 +216,142 @@ def ocr_guessed_spans(page: fitz.Page, sections: dict,
             "ocr_skipped_reason": "extraction_timeout" if timed_out else None}
 
 
-def _normalize_for_ocr_compare(text: str) -> str:
-    """Normalize text for OCR-vs-repair comparison (whitespace/case tolerant)."""
-    return re.sub(r'\s+', ' ', text).strip().lower()
-
-
-# ═══════════════════════════════════════════════════════════════
-# ANNOTATION DETECTION
-# ═══════════════════════════════════════════════════════════════
-
-def is_annotation(text: str, color_hex: str) -> bool:
-    """Detect dimension marker annotations."""
-    color_match = color_hex.lower() in ANNOTATION_COLORS
-    pattern_match = bool(DIMENSION_PATTERN.match(text.strip()))
-    arrow_match = text.strip() in ARROW_CHARS
-    return (color_match and pattern_match) or arrow_match
-
-
-# How much trailing noise may follow a production term and still be the same
-# mark. "Pasting Side 1" and "Varnish Free 2" qualify; a sentence that merely
-# begins with a production word does not.
-PRODUCTION_MARK_SUFFIX_MAX = 4
-
-
-def _production_key(text: str) -> str:
-    """Normalize a span for vocabulary lookup: case, punctuation, spacing.
-
-    The colon is kept because "scale 1:1" is itself a term, then stripped from
-    the ends so "Pasting Side:" still matches "pasting side".
-    """
-    key = re.sub(r'[^a-z0-9: ]', ' ', text.lower())
-    return re.sub(r'\s+', ' ', key).strip().strip(':').strip()
-
-
-def is_production_mark(text: str) -> bool:
-    """True when a span is a printer instruction rather than artwork copy."""
-    key = _production_key(text)
-    if not key:
-        return False
-    if key in PRODUCTION_MARK_TERMS:
-        return True
-    # Tolerate a short suffix ("Pasting Side 1") but never a full sentence that
-    # happens to open with a production word ("Stereo printing instructions
-    # are documented in the batch record" is artwork copy, not a mark).
-    for term in PRODUCTION_MARK_TERMS:
-        if key.startswith(term + " ") and len(key) - len(term) <= PRODUCTION_MARK_SUFFIX_MAX:
-            return True
-    return False
-
-
-def looks_like_production_mark(text: str, color_hex: str) -> bool:
-    """Shape of a production mark without a vocabulary hit — worth logging."""
-    stripped = text.strip()
-    if not PRODUCTION_MARK_SHAPE.match(stripped):
-        return False
-    if color_hex.lower() not in ANNOTATION_COLORS:
-        return False
-    return not is_production_mark(stripped)
-
-
-# ═══════════════════════════════════════════════════════════════
-# ROTATION DETECTION
-# ═══════════════════════════════════════════════════════════════
-
-def direction_to_rotation(dir_x: float, dir_y: float) -> int:
-    """Convert direction vector to rotation degrees (0, 90, 180, 270)."""
-    angle = math.degrees(math.atan2(dir_y, dir_x))
-    angle = round(angle)
-    if angle < 0:
-        angle += 360
-    return (round(angle / 90) * 90) % 360
-
 
 # ═══════════════════════════════════════════════════════════════
 # ZONE DETECTION
 # ═══════════════════════════════════════════════════════════════
 
-def detect_zones(paths: list, page_width_pt: float, page_height_pt: float,
-                 header_threshold_pt: float) -> list:
-    """Detect panel zones from path rectangles (fold lines)."""
-    vertical_lines = []
+ZONE_MIN_FOLD_RATIO = 0.30   # a fold line must span 30% of the ARTWORK's height
+ZONE_MIN_PANEL_PT = 20       # narrower than this is a gap, not a panel
+ZONE_Y_TOLERANCE_PT = 12     # spans may sit just outside the drawn artwork box
 
-    for path in paths:
-        bbox = path.get("bbox_pt", [0, 0, 0, 0])
-        x0, y0, x1, y1 = bbox
+
+def _segment_vertical_xs(raw_drawings: list, header_threshold_pt: float,
+                         min_fold_h: float) -> set:
+    """Scan individual path items for vertical segments that are fold lines.
+
+    CorelDRAW typically exports the carton dieline as one compound path whose
+    overall rect spans the full carton width (>>3 pt), so the drawing-bbox scan
+    in detect_zones() never finds the constituent fold lines.  Inspecting
+    drawing["items"] catches them regardless of how they were grouped in the
+    source file (B-12).
+    """
+    xs: set = set()
+    for drawing in raw_drawings:
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        # Skip drawings whose entire bounding box is in the header band
+        if rect[3] <= header_threshold_pt:
+            continue
+        for item in drawing.get("items", []):
+            try:
+                itype = item[0]
+                if itype == "l":          # straight line segment
+                    p1, p2 = item[1], item[2]
+                    seg_x0 = min(p1.x, p2.x)
+                    seg_x1 = max(p1.x, p2.x)
+                    seg_y0 = min(p1.y, p2.y)
+                    seg_y1 = max(p1.y, p2.y)
+                    if (seg_x1 - seg_x0 < 3
+                            and seg_y1 - seg_y0 > min_fold_h
+                            and seg_y1 > header_threshold_pt):
+                        xs.add(round(seg_x0))
+                elif itype == "re":       # rectangle sub-item
+                    sr = item[1]          # fitz.Rect
+                    sw = abs(sr.x1 - sr.x0)
+                    sh = abs(sr.y1 - sr.y0)
+                    if (sw < 3 and sh > min_fold_h
+                            and sr.y1 > header_threshold_pt):
+                        xs.add(round(sr.x0))
+            except (IndexError, AttributeError, TypeError):
+                continue
+    return xs
+
+
+def detect_zones(paths: list, header_threshold_pt: float,
+                 raw_drawings: Optional[list] = None) -> list:
+    """Detect panel zones from the artwork's vertical fold lines.
+
+    Two-pass approach:
+      Pass 1 — drawing bboxes (existing): catches fold lines drawn as individual
+               narrow paths (each fold line its own drawing object).
+      Pass 2 — drawing items (new): catches fold lines inside a compound path
+               whose overall bbox is wide.  CorelDRAW commonly exports all
+               dieline elements as one compound path, so pass 1 finds nothing
+               and pass 2 is the only route (B-12).
+
+    The fold-line height test is measured against the artwork's own bounding
+    box, not the sheet. A carton laid out on A4 has fold lines about 32 mm tall
+    against an 841 pt page: a 30%-of-page threshold is ~89 mm, so no small
+    component could ever satisfy it and every span came back zone=None,
+    which left no face model for any placement rule to run against (B-07).
+    """
+    body_paths = [p for p in paths
+                  if p.get("bbox_pt", [0, 0, 0, 0])[1] >= header_threshold_pt]
+    if not body_paths:
+        return []
+
+    art_x0 = min(p["bbox_pt"][0] for p in body_paths)
+    art_x1 = max(p["bbox_pt"][2] for p in body_paths)
+    art_y0 = min(p["bbox_pt"][1] for p in body_paths)
+    art_y1 = max(p["bbox_pt"][3] for p in body_paths)
+    art_h = max(1.0, art_y1 - art_y0)
+    min_fold_h = art_h * ZONE_MIN_FOLD_RATIO
+
+    # Pass 1: drawing-bbox scan (narrow whole drawings = individual fold lines)
+    vertical_lines: set = set()
+    for path in body_paths:
+        x0, y0, x1, y1 = path.get("bbox_pt", [0, 0, 0, 0])
         width = abs(x1 - x0)
         height = abs(y1 - y0)
+        if width < 3 and height > min_fold_h:
+            vertical_lines.add(round(x0))
 
-        # Vertical fold line: narrow + tall
-        if width < 3 and height > page_height_pt * 0.3:
-            vertical_lines.append(round(x0))
+    # Pass 2: item-level scan — compound path fold lines (B-12)
+    if len(vertical_lines) < 2 and raw_drawings:
+        vertical_lines |= _segment_vertical_xs(
+            raw_drawings, header_threshold_pt, min_fold_h
+        )
 
-    vertical_lines = sorted(set(vertical_lines))
+    vertical_lines_sorted = sorted(vertical_lines)
 
     zones = []
-    if len(vertical_lines) >= 2:
-        all_x = sorted(set([0] + vertical_lines + [round(page_width_pt)]))
+    if len(vertical_lines_sorted) >= 2:
+        # Bound the panels by the artwork, not the sheet, so the reported
+        # zone widths are the real panel widths a placement rule can check.
+        all_x = sorted(set([round(art_x0)] + vertical_lines_sorted + [round(art_x1)]))
         for i in range(len(all_x) - 1):
             x_start, x_end = all_x[i], all_x[i + 1]
-            if (x_end - x_start) < 20:
+            if (x_end - x_start) < ZONE_MIN_PANEL_PT:
                 continue
+            bbox = (x_start, art_y0, x_end, art_y1)
             zones.append({
-                "zone_id": f"panel_{i}",
-                "bbox_pt": [x_start, header_threshold_pt, x_end, page_height_pt],
-                "bbox_mm": bbox_to_mm((x_start, header_threshold_pt, x_end, page_height_pt)),
+                "zone_id": f"panel_{len(zones)}",
+                "bbox_pt": list(bbox),
+                "bbox_mm": bbox_to_mm(bbox),
                 "width_mm": pt_to_mm(x_end - x_start),
+                "height_mm": pt_to_mm(art_y1 - art_y0),
             })
 
     return zones
 
 
 def assign_span_to_zone(span_bbox: list, zones: list) -> Optional[str]:
-    """Assign a span to the zone containing its center point."""
+    """Assign a span to the panel whose X range contains its center.
+
+    Panels are vertical strips, so X is the discriminating axis; Y only has to
+    fall inside the artwork band, with tolerance for text that overhangs the
+    drawn fold box slightly.
+    """
     if not zones:
         return None
     cx = (span_bbox[0] + span_bbox[2]) / 2
     cy = (span_bbox[1] + span_bbox[3]) / 2
     for zone in zones:
-        zb = zone["bbox_pt"]
-        if zb[0] <= cx <= zb[2] and zb[1] <= cy <= zb[3]:
+        zx0, zy0, zx1, zy1 = zone["bbox_pt"]
+        if (zx0 <= cx <= zx1
+                and (zy0 - ZONE_Y_TOLERANCE_PT) <= cy <= (zy1 + ZONE_Y_TOLERANCE_PT)):
             return zone["zone_id"]
     return "outside"
 
@@ -547,10 +360,55 @@ def assign_span_to_zone(span_bbox: list, zones: list) -> Optional[str]:
 # EXTRACTION FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
+COLUMN_WIDTH_PT = 40          # ≈14 mm; column bucket width for sorting/spacing
+SPACING_SIZE_TOLERANCE = 0.25  # ±25% font size — beyond this it's a new block
+
+
+def compute_line_spacing(body_spans: list) -> None:
+    """Attach line_spacing to each body span, in place.
+
+    Only measured between consecutive spans that share a zone and a column
+    bucket and are set at a similar size — i.e. spans that are plausibly two
+    lines of the same paragraph. Measuring against whatever span happened to
+    sort next produced gaps that crossed columns and faces, which made the
+    insert 1.2-spacing requirement unverifiable (B-08).
+
+    Expects the list already sorted by (zone, column, y, x), and each span to
+    still carry the private _y0/_y1/_size geometry.
+    """
+    def bucket(s):
+        return (s.get("zone") or "z_outside",
+                round(s["bbox"][0] / COLUMN_WIDTH_PT),
+                s.get("rotation_deg", 0))
+
+    for i, s in enumerate(body_spans):
+        s["line_spacing"] = None
+        if i + 1 >= len(body_spans):
+            continue
+        nxt = body_spans[i + 1]
+        if bucket(s) != bucket(nxt):
+            continue
+
+        size = s.get("_size") or 0.0
+        next_size = nxt.get("_size") or 0.0
+        if size <= 0 or next_size <= 0:
+            continue
+        if abs(next_size - size) > size * SPACING_SIZE_TOLERANCE:
+            continue
+
+        # Baseline-to-baseline over font size is the standard leading ratio.
+        # Using bottom edges keeps it independent of ascender height.
+        delta = nxt.get("_y1", 0) - s.get("_y1", 0)
+        if delta <= 0:                       # same line, or out of order
+            continue
+        if delta > size * 4:                 # paragraph break, not line spacing
+            continue
+        s["line_spacing"] = round(delta / size, 2)
+
+
 def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dict:
     """Extract text with rotation, repair, and annotation filtering."""
     header_table = []
-    body = []
     annotations = []
     annotation_near_misses = []
     production_marks = []
@@ -579,9 +437,14 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
 
                 bbox = span.get("bbox", (0, 0, 0, 0))
                 font_name = span.get("font", "Unknown")
-                font_size = snap_size(span.get("size", 0))
+                # Keep the true size alongside the snapped one. Snapping is for
+                # grouping and display; a 2.75 pt span snaps to 3.0 and would
+                # silently pass a 3 pt minimum if that were the only value (B-05).
+                raw_size = span.get("size", 0) or 0.0
+                font_size = snap_size(raw_size)
                 color = span.get("color", 0)
                 flags = span.get("flags", 0)
+                in_header = bbox[1] < header_threshold
 
                 rotation_deg = direction_to_rotation(line_dir[0], line_dir[1])
 
@@ -595,8 +458,10 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                 # NOTE: OCR for guessed repairs happens in ocr_guessed_spans()
                 # as a bounded post-pass — never per-span in this hot loop.
 
-                # Annotation check
-                if is_annotation(repaired_text, color_hex):
+                # Annotation check. Header spans are exempt: a dimension in the
+                # tabular header is a declared field value ("60 mm" as Artwork
+                # size), not a callout, and must survive (B-01).
+                if is_annotation(repaired_text, color_hex, in_header=in_header):
                     annotations.append({
                         "text": repaired_text,
                         "color_hex": color_hex,
@@ -638,7 +503,8 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                 # Near-miss: looks like a dimension marker but color not in
                 # ANNOTATION_COLORS — either a new annotation color we haven't
                 # added yet, or a real body-text dimension. Log + flag it.
-                if DIMENSION_PATTERN.match(repaired_text.strip()) and color_hex.lower() not in ANNOTATION_COLORS:
+                # Header field values are exempt (see is_dimension_near_miss).
+                if is_dimension_near_miss(repaired_text, color_hex, in_header=in_header):
                     annotation_near_misses.append({
                         "text": repaired_text,
                         "color_hex": color_hex,
@@ -658,16 +524,24 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                     "ocr_text": None,  # filled by ocr_guessed_spans() post-pass
                     "font_name": get_base_font_name(font_name),
                     "font_name_full": font_name,
-                    "font_size_pt": font_size,
+                    "font_size_pt": font_size,          # snapped: display/grouping
+                    "font_size_pt_raw": round(raw_size, 3),  # authoritative for minimums
                     "is_bold": is_bold(font_name, flags),
                     "is_italic": is_italic(font_name, flags),
                     "color_hex": color_hex,
-                    "rotation_deg": rotation_deg,
+                    "rotation_deg": rotation_deg,       # PDF text direction
+                    "rotation_sop": ROTATION_SOP.get(rotation_deg, str(rotation_deg)),
                     "bbox": [snap_coord(b) for b in bbox],
                     "bbox_mm": bbox_to_mm(bbox),
+                    # Unrounded geometry, kept only until line spacing is
+                    # computed in extract_page_data; stripped before output.
+                    # The public bbox is rounded to whole points, which is up to
+                    # 1 pt of error on an 8 pt line — too coarse for a 1.2
+                    # spacing check.
+                    "_y0": bbox[1], "_y1": bbox[3], "_size": raw_size,
                 }
 
-                if bbox[1] < header_threshold:
+                if in_header:
                     header_table.append(span_data)
                 else:
                     body_spans_with_pos.append({
@@ -676,21 +550,12 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                         "font_size": font_size,
                     })
 
-    # Sort body by position
+    # Sort body by position. line_spacing is NOT computed here: at this point
+    # the neighbouring span in reading order is frequently in another column,
+    # which made the gap meaningless. It is computed in extract_page_data once
+    # zones and column buckets are known (B-08).
     body_spans_with_pos.sort(key=lambda x: (x["y0"], x["data"]["bbox"][0]))
-
-    # Line spacing: always computed here (cheap O(n)); extract_page_data strips
-    # the key for non-insert pages. This avoids re-parsing the entire page a
-    # second time just to add spacing when a page turns out to be an insert.
-    for i, info in enumerate(body_spans_with_pos):
-        sd = info["data"]
-        if i < len(body_spans_with_pos) - 1:
-            gap = body_spans_with_pos[i + 1]["y0"] - info["y1"]
-            fs = info["font_size"]
-            sd["line_spacing"] = round((gap + fs) / fs, 2) if fs > 0 else None
-        else:
-            sd["line_spacing"] = None
-        body.append(sd)
+    body = [info["data"] for info in body_spans_with_pos]
 
     return {"header_table": header_table, "body": body, "annotations": annotations,
             "annotation_near_misses": annotation_near_misses,
@@ -698,11 +563,16 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
             "production_mark_near_misses": production_mark_near_misses}
 
 
-def extract_paths_enhanced(page: fitz.Page) -> list:
-    """Extract paths with raw pt bbox for zone detection."""
+def extract_paths_enhanced(page: fitz.Page,
+                           raw_drawings: Optional[list] = None) -> list:
+    """Extract paths with raw pt bbox for zone detection.
+
+    Accepts pre-fetched raw_drawings to avoid a redundant get_drawings() call
+    when the caller already holds them (e.g. for segment-level fold detection).
+    """
     paths = []
     try:
-        drawings = page.get_drawings()
+        drawings = raw_drawings if raw_drawings is not None else page.get_drawings()
     except Exception:
         return paths
 
@@ -763,57 +633,72 @@ def extract_images(page: fitz.Page) -> list:
 # PAGE-LEVEL EXTRACTION
 # ═══════════════════════════════════════════════════════════════
 
-# Fuzzy "component type" matching — tolerate one corrupted/missing/extra char
-# per word so a corrupted span doesn't silently fall back to the generic
-# default page name.
-
-def _within_one_edit(a: str, b: str) -> bool:
-    """True if a and b are within Levenshtein distance 1."""
-    if a == b:
-        return True
-    la, lb = len(a), len(b)
-    if abs(la - lb) > 1:
-        return False
-    if la > lb:
-        a, b, la, lb = b, a, lb, la
-    # la <= lb, differ by 0 or 1
-    i = j = 0
-    edits = 0
-    while i < la and j < lb:
-        if a[i] == b[j]:
-            i += 1
-            j += 1
-        else:
-            edits += 1
-            if edits > 1:
-                return False
-            if la == lb:
-                i += 1  # substitution
-            j += 1      # deletion in b (or skip)
-    edits += (lb - j) + (la - i)
-    return edits <= 1
+# ─── Per-document colour profile ─────────────────────────────────
+# ANNOTATION_COLORS is a closed vocabulary tuned to one vendor's palette, and a
+# closed vocabulary is what caused B-01. Rather than enumerate every designer's
+# blue, look at how each colour is actually USED on this page: a colour carrying
+# several dimension callouts and no ordinary copy is a callout colour, whatever
+# its hex.
+#
+# This REPORTS the inference; it does not act on it. Auto-filtering on a guess
+# would delete artwork copy from a compliance review with no way to tell, and
+# the inference has not been validated against a second real artwork yet. Flip
+# ANNOTATION_COLOR_INFERENCE_ENFORCED once it has been.
+ANNOTATION_COLOR_INFERENCE_MIN_SPANS = 2
+ANNOTATION_COLOR_INFERENCE_ENFORCED = False
 
 
-def _find_component_type_end(text: str) -> Optional[int]:
-    """Find 'component type' in text (exact, then fuzzy with 1-char tolerance
-    per word). Returns the index just past the match, or None."""
-    m = re.search(r'(?i)component\s+type', text)
-    if m:
-        return m.end()
-    # Fuzzy: scan consecutive word pairs
-    for wm in re.finditer(r'\S+', text):
-        w1 = wm.group()
-        rest = text[wm.end():]
-        wm2 = re.match(r'\s+(\S+)', rest)
-        if not wm2:
+def profile_span_colors(sections: dict) -> dict:
+    """Frequency of every colour on the page, and which unknown colours behave
+    like callout colours.
+
+    Returns the histogram (most used first) plus the inferred set, so a new
+    vendor's palette surfaces as data instead of silently passing through as
+    body text.
+    """
+    spans = sections.get("body", []) + sections.get("header_table", [])
+    counts = {}
+    dimension_only = {}
+
+    for s in spans:
+        color = (s.get("color_hex") or "").lower()
+        if not color:
             continue
-        w2 = wm2.group(1)
-        # Strip trailing punctuation like ':' from w2 for comparison
-        w2_clean = w2.rstrip(':-')
-        if (_within_one_edit(w1.lower(), 'component')
-                and _within_one_edit(w2_clean.lower(), 'type')):
-            return wm.end() + wm2.end() - (len(w2) - len(w2_clean))
-    return None
+        counts[color] = counts.get(color, 0) + 1
+        stats = dimension_only.setdefault(color, {"dimension": 0, "other": 0})
+        if DIMENSION_PATTERN.match(s.get("text", "").strip()):
+            stats["dimension"] += 1
+        else:
+            stats["other"] += 1
+
+    # Callouts filtered as annotations never reach body/header_table, so count
+    # them too — otherwise a correctly-detected colour looks unused here.
+    for a in sections.get("annotations", []):
+        color = (a.get("color_hex") or "").lower()
+        if color:
+            counts[color] = counts.get(color, 0) + 1
+
+    inferred = sorted(
+        color for color, stats in dimension_only.items()
+        if stats["dimension"] >= ANNOTATION_COLOR_INFERENCE_MIN_SPANS
+        and stats["other"] == 0
+        and not is_annotation_color(color)
+    )
+
+    for color in inferred:
+        logger.warning(
+            "Colour %s carries %d dimension spans and no body copy — it looks "
+            "like a callout colour missing from ANNOTATION_COLORS",
+            color, dimension_only[color]["dimension"],
+        )
+
+    return {
+        "histogram": [{"color_hex": c, "spans": n}
+                      for c, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "unknown_colors": sorted(c for c in counts if not is_annotation_color(c)),
+        "inferred_annotation_colors": inferred,
+        "inference_enforced": ANNOTATION_COLOR_INFERENCE_ENFORCED,
+    }
 
 
 def _detect_page_name_from_content(sections: dict, default_name: str) -> tuple:
@@ -853,20 +738,582 @@ def _detect_page_name_from_content(sections: dict, default_name: str) -> tuple:
     return default_name, False
 
 
+# ─── Header detection (B-10) ─────────────────────────────────────
+# The header used to be defined as "anything in the top 20% of the page", which
+# means the extractor asserted the very thing the SOP rule "header must be
+# positioned in the upper centre" needs to verify — the data could never
+# contradict the assumption. Find it by its field labels instead, and report
+# where it actually turned out to be.
+
+# Alias -> canonical field name. Aliases are canonicalised because a single
+# "AC Reference" line matches both "ac ref" and "ac reference", which would let
+# one line satisfy HEADER_MIN_LABELS on its own.
+HEADER_FIELD_LABELS = {
+    "product name": "product name",
+    "ac reference": "ac reference",
+    "ac ref": "ac reference",
+    "component type": "component type",
+    "substrate": "substrate",
+    "pantone no": "pantone no",
+    "artwork size": "artwork size",
+    "flat size": "flat size",
+    "print side": "print side",
+    "colour code": "colour code",
+    "color code": "colour code",
+    "market": "market",
+    "version": "version",
+    "dimension": "dimension",
+    "size in mm": "dimension",
+    # Cartons label this "Size in mm (LxWxH)", labels and inserts just
+    # "Size (LxW)" -- which matched nothing, so the declared footprint was
+    # unreadable on every component except the carton. Spelled out rather than
+    # adding a bare "size", which would also swallow "artwork size" and
+    # "flat size" (different canonicals, matched by substring).
+    "size lxw": "dimension",
+    "size lxwxh": "dimension",
+}
+HEADER_MIN_LABELS = 2          # one stray phrase is not a header
+HEADER_FALLBACK_RATIO = 0.20   # top-of-page guess when content detection fails
+HEADER_PAD_PT = 6              # tolerance below the lowest header row
+HEADER_ROW_PITCH_TOLERANCE = 1.8   # a row this far past the normal pitch ends the table
+HEADER_MAX_EXTENT_RATIO = 0.45     # never let the band swallow half the sheet
+
+
+def _median(values: list) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _grow_header_band(rows: list, seed_idx: list, height_pt: float) -> list:
+    """Extend a seed of matched label rows across the rest of the table.
+
+    The header is a table, and only some of its labels are in the vocabulary.
+    Stopping at the lowest *recognised* label left rows like "Size (W) | 60 mm"
+    below the split, in the body, where their dimension values were then logged
+    as annotation near-misses and forced needs_review on a clean page.
+
+    Rows are absorbed while they keep the table's row pitch and overlap it
+    horizontally; the first big vertical gap is the header/artwork boundary.
+    """
+    first, last = min(seed_idx), max(seed_idx)
+
+    # Row pitch measured from the matched rows themselves, so a dense header
+    # and an airy one each get their own gate rather than a fixed constant.
+    seed_tops = [rows[i]["bbox"][1] for i in seed_idx]
+    pitches = [b - a for a, b in zip(seed_tops, seed_tops[1:]) if b > a]
+    if pitches:
+        pitch = _median(pitches)
+    else:
+        heights = [rows[i]["bbox"][3] - rows[i]["bbox"][1] for i in seed_idx]
+        pitch = max(_median(heights) * 2, 1.0)
+    max_gap = pitch * HEADER_ROW_PITCH_TOLERANCE
+
+    def overlaps(idx, lo, hi):
+        b = rows[idx]["bbox"]
+        return b[0] <= hi and b[2] >= lo
+
+    band_x0 = min(rows[i]["bbox"][0] for i in seed_idx)
+    band_x1 = max(rows[i]["bbox"][2] for i in seed_idx)
+    ceiling = height_pt * HEADER_MAX_EXTENT_RATIO
+
+    # Downward: the common case — unrecognised field rows under the last label.
+    while last + 1 < len(rows):
+        nxt = rows[last + 1]
+        if nxt["bbox"][1] - rows[last]["bbox"][1] > max_gap:
+            break
+        if not overlaps(last + 1, band_x0, band_x1):
+            break
+        if nxt["bbox"][3] > ceiling:
+            break
+        last += 1
+        band_x0 = min(band_x0, nxt["bbox"][0])
+        band_x1 = max(band_x1, nxt["bbox"][2])
+
+    # Upward: a title or code row sitting above the first recognised label.
+    while first - 1 >= 0:
+        prev = rows[first - 1]
+        if rows[first]["bbox"][1] - prev["bbox"][1] > max_gap:
+            break
+        if not overlaps(first - 1, band_x0, band_x1):
+            break
+        first -= 1
+        band_x0 = min(band_x0, prev["bbox"][0])
+        band_x1 = max(band_x1, prev["bbox"][2])
+
+    return list(range(first, last + 1))
+
+
+def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
+    """Locate the tabular header by its field labels.
+
+    Returns the split threshold plus the measured geometry, so a placement rule
+    has a real bounding box to check against Artwork Headers V2 §3 (Carton
+    180x48 mm, Foil 180x36 mm, and so on).
+    """
+    fallback = height_pt * HEADER_FALLBACK_RATIO
+    try:
+        words = page.get_text("words")
+    except Exception:
+        words = []
+
+    lines = {}
+    for w in words:
+        if len(w) < 8:
+            continue
+        x0, y0, x1, y1, word, block_no, line_no, _ = w[:8]
+        entry = lines.setdefault((block_no, line_no), {"words": [], "bbox": [x0, y0, x1, y1]})
+        entry["words"].append(word)
+        b = entry["bbox"]
+        b[0], b[1] = min(b[0], x0), min(b[1], y0)
+        b[2], b[3] = max(b[2], x1), max(b[3], y1)
+
+    # Sorted top-to-bottom so the band can grow over adjacent rows.
+    rows = sorted(lines.values(), key=lambda e: (e["bbox"][1], e["bbox"][0]))
+
+    seed_idx = []
+    found_labels = set()
+    for i, entry in enumerate(rows):
+        key = _label_key(" ".join(entry["words"]))
+        hits = {canon for alias, canon in HEADER_FIELD_LABELS.items() if alias in key}
+        if hits:
+            found_labels |= hits
+            seed_idx.append(i)
+
+    if len(found_labels) < HEADER_MIN_LABELS or not seed_idx:
+        return {
+            "threshold_pt": fallback,
+            "detected_by_content": False,
+            "labels_found": sorted(found_labels),
+            "rows_in_band": 0, "unlabelled_rows_absorbed": 0,
+            "bbox_mm": None, "width_mm": None, "height_mm": None,
+            "vertical_position": None, "horizontal_position": None,
+        }
+
+    band_idx = _grow_header_band(rows, seed_idx, height_pt)
+    band = [rows[i]["bbox"] for i in band_idx]
+
+    x0 = min(b[0] for b in band)
+    y0 = min(b[1] for b in band)
+    x1 = max(b[2] for b in band)
+    y1 = max(b[3] for b in band)
+
+    page_w = page.rect.width or 1.0
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    left_gap, right_gap = x0, page_w - x1
+    if abs(left_gap - right_gap) <= max(page_w * 0.05, 6):
+        horizontal = "centre"
+    else:
+        horizontal = "left" if cx < page_w / 2 else "right"
+
+    third = (height_pt or 1.0) / 3
+    vertical = "upper" if cy < third else ("middle" if cy < 2 * third else "lower")
+
+    return {
+        # Split just below the label block, not at an arbitrary page fraction.
+        "threshold_pt": min(y1 + HEADER_PAD_PT, height_pt),
+        "detected_by_content": True,
+        "labels_found": sorted(found_labels),
+        # How much of the band came from vocabulary hits vs. row-pitch growth.
+        # A high absorbed count means this artwork's field labels are mostly
+        # unknown to HEADER_FIELD_LABELS — worth a look before the vocabulary
+        # drifts further out of date.
+        "rows_in_band": len(band_idx),
+        "unlabelled_rows_absorbed": len(band_idx) - len(seed_idx),
+        "bbox_mm": bbox_to_mm((x0, y0, x1, y1)),
+        "width_mm": pt_to_mm(x1 - x0),
+        "height_mm": pt_to_mm(y1 - y0),
+        "vertical_position": vertical,
+        "horizontal_position": horizontal,
+    }
+
+
+# The SOP writes the artwork code as one string, ACnnnV.n, but the tabular
+# header stores it as two separate fields. Anything that needs the whole value
+# had to join them itself, and did so inconsistently run to run ("AC2499V.10"
+# one time, "2499, 10" another), so a self-comparison failed on formatting
+# rather than on content. Synthesised once here instead; downstream reads
+# ac_reference and never rebuilds it.
+AC_COMPOSITE_RE = re.compile(r"\bAC\s*(\d+)\s*V\.?\s*(\d+)\b", re.IGNORECASE)
+
+# Row banding: spans whose vertical centres sit within this many points belong
+# to the same header row. Header rows in real artwork run ~14-20 pt apart, and
+# a value can be a couple of points off its label's baseline when font sizes
+# differ within the row.
+AC_ROW_BAND_PT = 6.0
+
+# Shapes the two header values must take. Passed into the lookup so a prose
+# neighbour is never selected in the first place.
+AC_NUMBER_SHAPE = re.compile(r"\d+")
+VERSION_SHAPE = re.compile(r"[\d.]+")
+
+
+def _span_center_y(span: dict) -> float:
+    bbox = span.get("bbox") or [0, 0, 0, 0]
+    return (bbox[1] + bbox[3]) / 2
+
+
+def _value_for_label(header_table: list, canonical: str,
+                     shape: Optional[Any] = None) -> Optional[str]:
+    """Find the value span sitting to the right of a header label.
+
+    Matched by position, not list order. header_table is appended in raw
+    PyMuPDF span order (unlike body, it is never sorted), so "the next item in
+    the list" is not reliably the value. The header is also two label/value
+    pairs wide -- "Product Name | ... | AC Reference | 2499" -- so the match has
+    to be the NEAREST span to the right within the same row, not the last one.
+
+    A label can occur more than once on a page. When the header band over-grows
+    and absorbs body copy, an insert's own revision footer ("Version: AEMPS-
+    Medaxone 1 g-V2-mar2025") lands in header_table alongside the real header
+    field. Candidates are therefore resolved per label occurrence, topmost
+    first, rather than by taking the smallest gap across all occurrences --
+    that let the footer's neighbour, 18 pt away, outbid the genuine value
+    89 pt away and null the whole field.
+
+    shape is an optional compiled pattern the value must fullmatch. Applying it
+    during selection rather than afterwards means a prose neighbour is skipped
+    in favour of the real value, instead of winning and then being discarded.
+    """
+    labels = [alias for alias, canon in HEADER_FIELD_LABELS.items()
+              if canon == canonical]
+
+    def accepts(text: str) -> bool:
+        return shape is None or shape.fullmatch(text.strip()) is not None
+
+    # Header fields live in the header band at the top of the page; a body line
+    # repeating a field label always sits below it. Ties go to the higher span.
+    matches = [span for span in header_table
+               if any(alias in _label_key(span.get("text", ""))
+                      for alias in labels)]
+    matches.sort(key=lambda s: (s.get("bbox") or [0, 0, 0, 0])[1])
+
+    for span in matches:
+        key = _label_key(span.get("text", ""))
+
+        # A merged cell can hold both label and value ("Version# 10"); prefer
+        # that reading when the label span itself carries trailing digits.
+        inline = re.search(r"(\d[\d.\-/]*)\s*$", span.get("text", "").strip())
+        if (inline and _label_key(inline.group(1)) != key
+                and accepts(inline.group(1))):
+            return inline.group(1)
+
+        label_bbox = span.get("bbox") or [0, 0, 0, 0]
+        label_mid = _span_center_y(span)
+
+        best_value = None
+        best_gap = None
+        for other in header_table:
+            if other is span:
+                continue
+            other_bbox = other.get("bbox") or [0, 0, 0, 0]
+            if abs(_span_center_y(other) - label_mid) > AC_ROW_BAND_PT:
+                continue
+            gap = other_bbox[0] - label_bbox[2]
+            if gap < 0:                      # left of the label, not its value
+                continue
+            text = (other.get("text") or "").strip()
+            if not text:
+                continue
+            # Skip the next label in the same row (e.g. "AC Reference" sitting
+            # to the right of "Product Name") -- a label is never a value.
+            other_key = _label_key(text)
+            if any(alias in other_key for alias in HEADER_FIELD_LABELS):
+                continue
+            if not accepts(text):
+                continue
+            if best_gap is None or gap < best_gap:
+                best_gap, best_value = gap, text
+
+        if best_value is not None:
+            return best_value
+
+    return None
+
+
+# How close to an edge the on-pack instance must sit to count as an edge
+# placement. The SOP requires this string on the right edge reading bottom-to-
+# top, so the rule needs the side, not just the coordinates.
+AC_EDGE_MARGIN_MM = 15.0
+
+
+def _artboard_bounds_mm(all_spans: list, page_w_mm: Optional[float],
+                        page_h_mm: Optional[float]) -> tuple:
+    """Extent of the drawn artboard, not the sheet it sits on.
+
+    The SOP's "right edge of the artboard" is the artwork's own edge. Artwork
+    is placed on an oversized sheet -- the insert measures 148x250 mm on a
+    250x350 mm page -- so measuring from the page put the rotated edge code
+    51 mm inside the "right" margin and classified it as interior.
+    """
+    xs = [s["bbox_mm"][2] for s in all_spans if s.get("bbox_mm")]
+    x0s = [s["bbox_mm"][0] for s in all_spans if s.get("bbox_mm")]
+    ys = [s["bbox_mm"][3] for s in all_spans if s.get("bbox_mm")]
+    y0s = [s["bbox_mm"][1] for s in all_spans if s.get("bbox_mm")]
+    if not xs:
+        return (0.0, 0.0, page_w_mm or 0.0, page_h_mm or 0.0)
+    return (min(x0s), min(y0s), max(xs), max(ys))
+
+
+def _edge_position(bbox_mm: list, bounds: tuple) -> Optional[str]:
+    """Which artboard edge a span sits against, or "interior"."""
+    if not bbox_mm or len(bbox_mm) < 4:
+        return None
+    x0, y0, x1, y1 = bbox_mm[:4]
+    bx0, by0, bx1, by1 = bounds
+    if bx1 - x1 <= AC_EDGE_MARGIN_MM:
+        return "right"
+    if x0 - bx0 <= AC_EDGE_MARGIN_MM:
+        return "left"
+    if y0 - by0 <= AC_EDGE_MARGIN_MM:
+        return "top"
+    if by1 - y1 <= AC_EDGE_MARGIN_MM:
+        return "bottom"
+    return "interior"
+
+
+def synthesize_ac_reference(header_table: list, body_text_all: str,
+                            all_spans: Optional[list] = None,
+                            page_w_mm: Optional[float] = None,
+                            page_h_mm: Optional[float] = None) -> dict:
+    """Combine the header's split AC Reference / Version fields into the single
+    canonical ACnnnV.n string, and report whether the same value appears
+    on-pack (rotated on a flap or edge, per the SOP), including where.
+
+    consistent is None -- not False -- when either side is missing: absence of
+    an on-pack instance is a different finding from a genuine mismatch, and
+    collapsing them would make a missing value read as a contradiction.
+
+    all_spans is every span on the page, whatever section it was filed under.
+    Searching body alone made this field depend on how the header band happened
+    to be drawn: on insert pages the band over-grew and absorbed the rotated
+    edge instance into header_table, so on_pack_instance came back null on
+    pages 3 and 4 of Art-CommercialPDF-12168 while pages 1 and 2 resolved it.
+    The code is printed on the pack either way; which bucket the band sorted it
+    into is an extraction detail and must not change the finding.
+
+    The matched span's coordinates and rotation are reported alongside, so a
+    rule checking placement ("right edge, 90 CCW") reads a measured field
+    instead of re-scanning spans it may not find.
+    """
+    ac_number = _value_for_label(header_table, "ac reference", AC_NUMBER_SHAPE)
+    version_number = _value_for_label(header_table, "version", VERSION_SHAPE)
+
+    header_combined = None
+    if ac_number and version_number:
+        header_combined = f"AC{ac_number.strip()}V.{version_number.strip()}"
+
+    # Span-level first, so position and rotation come with the match. Header
+    # label/value cells are skipped -- the header's own declaration is not an
+    # on-pack instance of it, or every page would trivially "match itself".
+    on_pack_instance = None
+    on_pack_position = None
+    bounds = _artboard_bounds_mm(all_spans or [], page_w_mm, page_h_mm)
+    label_ids = {id(s) for s in (header_table or [])
+                 if _label_key(s.get("text", "")) in HEADER_FIELD_LABELS}
+    for span in (all_spans or []):
+        if id(span) in label_ids:
+            continue
+        match = AC_COMPOSITE_RE.search(span.get("text") or "")
+        if not match:
+            continue
+        bbox_mm = span.get("bbox_mm")
+        on_pack_instance = match.group(0).strip()
+        on_pack_position = {
+            "bbox_mm": bbox_mm,
+            "rotation_deg": span.get("rotation_deg"),
+            "rotation_sop": span.get("rotation_sop"),
+            "edge": _edge_position(bbox_mm, bounds),
+            "artboard_bounds_mm": [round(v, 2) for v in bounds],
+            "font_size_pt": span.get("font_size_pt"),
+        }
+        break
+
+    # Fall back to the concatenated text: the composite can be split across
+    # spans, which the per-span scan above cannot see. No position then.
+    if on_pack_instance is None:
+        text_match = AC_COMPOSITE_RE.search(body_text_all or "")
+        on_pack_instance = text_match.group(0).strip() if text_match else None
+
+    consistent = None
+    if header_combined and on_pack_instance:
+        # Compared on digits alone: the on-pack instance is set in tiny rotated
+        # type where spacing round the "V." is unreliable, and a whitespace
+        # difference is not a content difference.
+        normalize = lambda s: re.sub(r"[^0-9a-z]", "", s.lower())
+        consistent = normalize(header_combined) == normalize(on_pack_instance)
+
+    return {
+        "header_combined": header_combined,
+        "ac_number": ac_number.strip() if ac_number else None,
+        "version": version_number.strip() if version_number else None,
+        "on_pack_instance": on_pack_instance,
+        "on_pack_position": on_pack_position,
+        "consistent": consistent,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DIMENSION CROSS-CHECK
+# ═══════════════════════════════════════════════════════════════
+#
+# Three independent sources state the component's size and nothing compared
+# them: the header's declared field ("38x38x67 mm"), the printed callouts
+# ("38.00 mm"), and the drawn geometry. The callouts are read as text, not
+# measured, so on their own they verify nothing -- a drawing that says 38 mm
+# while measuring 42 mm read as perfectly consistent. Cross-checked here once,
+# for the same reason ac_reference is: so no consumer re-derives it and gets a
+# different answer each run.
+
+DIMENSION_TOLERANCE_MM = 0.5      # print tolerance; observed error is ~0.02 mm
+SHEET_TOLERANCE_MM = 1.0          # a rect this close to the page IS the sheet
+
+# Declared footprints are written "38x38x67 mm", "70x30mm", "148x250mm".
+DIMENSION_VALUE_SHAPE = re.compile(
+    r"[\d.]+(?:\s*[x×]\s*[\d.]+){1,2}\s*(?:mm)?", re.IGNORECASE)
+DIMENSION_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _dimension_numbers(text: Optional[str]) -> list:
+    return [float(n) for n in DIMENSION_NUMBER_RE.findall(text or "")]
+
+
+def _component_rects(paths: list, page_w_mm: float, page_h_mm: float) -> list:
+    """Drawn rectangles that could be a component outline.
+
+    The sheet rect is dropped -- every page carries one and it would match a
+    declared size only by coincidence. Everything else is kept: matching is
+    done on whole rects, not on edge lengths, because edges are not
+    discriminating (page 1 has 37 distinct edge lengths, so a declared value
+    finds a match by chance; it has only a handful of distinct large rects).
+    """
+    rects = []
+    for path in paths:
+        bbox = path.get("bbox_mm")
+        if not bbox:
+            continue
+        width = round(bbox[2] - bbox[0], 2)
+        height = round(bbox[3] - bbox[1], 2)
+        if width <= 0 or height <= 0:
+            continue
+        if (abs(width - page_w_mm) <= SHEET_TOLERANCE_MM
+                and abs(height - page_h_mm) <= SHEET_TOLERANCE_MM):
+            continue
+        rects.append((width, height))
+    return rects
+
+
+def _match_rect(rects: list, side_a: float, side_b: float) -> Optional[dict]:
+    """Closest drawn rect to a declared side pair, in either orientation."""
+    best = None
+    for width, height in rects:
+        for candidate in ((width, height), (height, width)):
+            delta = max(abs(candidate[0] - side_a), abs(candidate[1] - side_b))
+            if delta <= DIMENSION_TOLERANCE_MM and (best is None
+                                                    or delta < best["delta_mm"]):
+                best = {"measured_mm": [width, height],
+                        "delta_mm": round(delta, 3)}
+    return best
+
+
+def synthesize_dimension_check(header_table: list, annotations: list,
+                               near_misses: list, paths: list,
+                               page_w_mm: float, page_h_mm: float) -> dict:
+    """Reconcile declared size, printed callouts, and drawn geometry.
+
+    consistent is None -- not False -- when a source is missing, matching
+    ac_reference's contract: an unmeasurable page is not a failing page.
+    """
+    declared_raw = _value_for_label(header_table, "dimension",
+                                    DIMENSION_VALUE_SHAPE)
+    declared = _dimension_numbers(declared_raw)
+
+    # Callouts normally arrive as classified annotations. On an unknown vendor
+    # palette they land in near-misses instead; read those rather than let the
+    # whole check go quiet on a colour we simply haven't seen before.
+    callout_source = "annotations"
+    spans = [a for a in annotations
+             if DIMENSION_PATTERN.match((a.get("text") or "").strip())]
+    if not spans:
+        spans = [a for a in near_misses
+                 if DIMENSION_PATTERN.match((a.get("text") or "").strip())]
+        callout_source = "annotation_near_misses" if spans else None
+    callouts = sorted({v for s in spans
+                       for v in _dimension_numbers(s.get("text"))})
+
+    rects = _component_rects(paths, page_w_mm, page_h_mm)
+
+    # Every distinct pair of declared sides should be drawn somewhere: a
+    # 38x38x67 carton shows a 38x67 face and a 38x38 face.
+    pairs = sorted({(min(a, b), max(a, b))
+                    for i, a in enumerate(declared)
+                    for b in declared[i + 1:]})
+    pair_results = []
+    for side_a, side_b in pairs:
+        match = _match_rect(rects, side_a, side_b)
+        pair_results.append({
+            "declared_mm": [side_a, side_b],
+            "matched": match is not None,
+            "measured_mm": match["measured_mm"] if match else None,
+            "delta_mm": match["delta_mm"] if match else None,
+        })
+
+    measured_ok = None
+    if pairs and rects:
+        measured_ok = all(p["matched"] for p in pair_results)
+
+    unmatched_callouts = [c for c in callouts
+                          if not any(abs(c - d) <= DIMENSION_TOLERANCE_MM
+                                     for d in declared)]
+    callouts_ok = None
+    if declared and callouts:
+        callouts_ok = not unmatched_callouts
+
+    consistent = None
+    if measured_ok is not None or callouts_ok is not None:
+        consistent = all(flag for flag in (measured_ok, callouts_ok)
+                         if flag is not None)
+
+    return {
+        "declared_raw": declared_raw,
+        "declared_mm": declared or None,
+        "callouts_mm": callouts or None,
+        "callout_source": callout_source,
+        "measured_pairs": pair_results,
+        "declared_vs_measured": measured_ok,
+        "declared_vs_callouts": callouts_ok,
+        "unmatched_callouts_mm": unmatched_callouts or None,
+        "tolerance_mm": DIMENSION_TOLERANCE_MM,
+        "consistent": consistent,
+    }
+
+
 def extract_page_data(page: fitz.Page, page_index: int,
                       deadline: Optional[float] = None) -> dict:
     """Extract all data from a single page with enhanced features."""
-    config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
+    config = page_slot(page_index)
 
     rect = page.rect
     width_pt, height_pt = rect.width, rect.height
-    header_threshold = height_pt * 0.20
 
-    # 1. Paths first (zone detection needs them)
-    paths = extract_paths_enhanced(page)
+    # Header located by its field labels, with a top-of-page fallback (B-10).
+    header_region = detect_header_region(page, height_pt)
+    header_threshold = header_region["threshold_pt"]
 
-    # 2. Zone detection
-    zones = detect_zones(paths, width_pt, height_pt, header_threshold)
+    # 1. Paths first (zone detection needs them). Fetch drawings once so both
+    # extract_paths_enhanced and detect_zones share the same call result —
+    # get_drawings() can be expensive on complex dieline art.
+    raw_drawings = page.get_drawings()
+    paths = extract_paths_enhanced(page, raw_drawings=raw_drawings)
+
+    # 2. Zone detection — pass raw drawings so the item-level fold-line scan
+    # (B-12) can recover panels from compound paths where the overall bbox is
+    # too wide for the drawing-bbox pass to catch.
+    zones = detect_zones(paths, header_threshold, raw_drawings=raw_drawings)
 
     # 3. Text extraction — single pass; line_spacing is always computed and
     # stripped below for non-insert pages (no second full parse needed)
@@ -877,11 +1324,6 @@ def extract_page_data(page: fitz.Page, page_index: int,
 
     # 5. Check if it's actually an insert based on REAL content
     is_insert = "insert" in detected_name.lower()
-
-    # 6. Non-inserts don't expose line_spacing (preserves original output shape)
-    if not is_insert:
-        for span in sections["body"]:
-            span.pop("line_spacing", None)
 
     # 6b. Bounded OCR post-pass for guessed repairs — runs ONCE, after the
     # final sections are settled (never inside the span hot loop).
@@ -897,7 +1339,7 @@ def extract_page_data(page: fitz.Page, page_index: int,
     # differently from wider siblings also starting at x=246 (cx=261+) if we
     # used center X. Left edge ensures all items starting at the same column
     # margin land in the same bucket regardless of width.
-    def _col_sort_key(s, col_w_pt=40):
+    def _col_sort_key(s, col_w_pt=COLUMN_WIDTH_PT):
         b = s["bbox"]
         left_x = b[0]   # left edge — consistent column alignment
         zone_id = s.get("zone") or "z_outside"
@@ -906,29 +1348,52 @@ def extract_page_data(page: fitz.Page, page_index: int,
 
     sections["body"].sort(key=_col_sort_key)
 
+    # 7b. Line spacing, now that zone and column are known. Non-inserts don't
+    # expose it (preserves the original output shape), but a page whose name was
+    # never detected keeps it — dropping it on a page that might BE an insert
+    # loses the only data its own rule needs (B-11).
+    compute_line_spacing(sections["body"])
+    if not is_insert and page_name_detected:
+        for span in sections["body"]:
+            span.pop("line_spacing", None)
+    for span in sections["body"] + sections["header_table"]:
+        for k in ("_y0", "_y1", "_size"):
+            span.pop(k, None)
+
     # 5. Images
     images = extract_images(page)
 
-    # 6. Build convenience strings
+    # 6. Build convenience strings.
+    # body_text keeps its original meaning (upright spans only) so existing
+    # consumers don't shift under them. body_text_all is the complete one:
+    # the SOP *requires* the AC reference and the batch-coding labels to be
+    # rotated, so the elements most certain to be rotated were exactly the ones
+    # a presence check on body_text could never find (B-03). Presence rules
+    # should read body_text_all; rotation rules read rotated_elements.
     body_normal = [s["text"] for s in sections["body"] if s.get("rotation_deg", 0) == 0]
     body_text = " ".join(body_normal)
+    body_text_all = " ".join(s["text"] for s in sections["body"])
 
     rotated_elements = [
         {"text": s["text"], "rotation_deg": s["rotation_deg"],
+         "rotation_sop": s.get("rotation_sop"),
          "bbox_mm": s["bbox_mm"], "zone": s.get("zone")}
         for s in sections["body"] if s.get("rotation_deg", 0) != 0
     ]
 
-    # Count repairs + unresolved (guessed / OCR-disagreement) corruption
+    # Count repairs + unresolved corruption. "failed" counts too: it marks
+    # U+FFFD damage we deliberately refused to guess at, which is precisely the
+    # case a human needs to look at (B-06).
+    UNRESOLVED = ("guessed", "ocr_disagreement", "failed")
     all_spans = sections["body"] + sections["header_table"]
     repair_count = sum(1 for s in all_spans if s.get("repaired"))
     unresolved_corruption_count = sum(
         1 for s in all_spans
-        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement")
+        if s.get("corruption_confidence") in UNRESOLVED
     )
     guessed_fonts = sorted({
         s.get("font_name_full") for s in all_spans
-        if s.get("corruption_confidence") in ("guessed", "ocr_disagreement", "ocr_confirmed")
+        if s.get("corruption_confidence") in UNRESOLVED + ("ocr_confirmed",)
     })
 
     # Clean up paths for output
@@ -942,12 +1407,60 @@ def extract_page_data(page: fitz.Page, page_index: int,
     for z in zones:
         clean_zones.append({k: v for k, v in z.items() if k != "bbox_pt"})
 
+    color_profile = profile_span_colors(sections)
+
+    # Named reasons rather than one opaque boolean. Ordered most to least
+    # likely to mean the extraction itself is wrong, so a triage step can act
+    # on the first entry.
+    review_reasons = []
+    if unresolved_corruption_count > 0:
+        review_reasons.append("unresolved_corruption")
+    if ocr_info.get("ocr_skipped_reason"):
+        review_reasons.append("ocr_" + ocr_info["ocr_skipped_reason"])
+    if not header_region["detected_by_content"]:
+        # Everything positional downstream is a guess when this is set, so a
+        # near-miss reported alongside it is far more likely a false alarm.
+        review_reasons.append("header_not_detected")
+    if not page_name_detected:
+        review_reasons.append("page_name_not_detected")
+    if sections.get("annotation_near_misses"):
+        review_reasons.append("annotation_near_miss")
+    if sections.get("production_mark_near_misses"):
+        review_reasons.append("production_mark_near_miss")
+    if color_profile["inferred_annotation_colors"]:
+        review_reasons.append("unknown_annotation_color")
+
     return {
         "name": detected_name,
         "sections": sections,
         "body_text": body_text,
+        "body_text_all": body_text_all,
         "rotated_elements": rotated_elements,
         "zones": clean_zones,
+        # Measured header geometry, so the "header must be in the upper centre"
+        # rule has something it can actually test (B-10).
+        "header_region": {
+            k: v for k, v in header_region.items() if k != "threshold_pt"
+        },
+        # Canonical ACnnnV.n, synthesised once so no consumer re-derives it.
+        # Every section is passed, not just body: the on-pack instance is on the
+        # pack regardless of which bucket the header band sorted it into.
+        "ac_reference": synthesize_ac_reference(
+            sections["header_table"], body_text_all,
+            all_spans=(sections["body"] + sections["header_table"]
+                       + sections["annotations"]
+                       + sections.get("annotation_near_misses", [])),
+            page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
+        ),
+        # Declared size vs printed callouts vs drawn geometry, reconciled once.
+        "dimension_check": synthesize_dimension_check(
+            sections["header_table"], sections["annotations"],
+            sections.get("annotation_near_misses", []), clean_paths,
+            pt_to_mm(width_pt), pt_to_mm(height_pt),
+        ),
+        # How colour is actually used on this page, so a new vendor's callout
+        # palette surfaces as data instead of silently reading as body copy.
+        "color_profile": color_profile,
         "page_dimensions": {
             "width_pt": round(width_pt, 2),
             "height_pt": round(height_pt, 2),
@@ -967,6 +1480,9 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "zones_detected": len(zones),
             "rotated_elements_count": len(rotated_elements),
             "page_name_detected": page_name_detected,
+            "header_detected_by_content": header_region["detected_by_content"],
+            "header_unlabelled_rows_absorbed": header_region.get("unlabelled_rows_absorbed", 0),
+            "inferred_annotation_colors": color_profile["inferred_annotation_colors"],
             "ocr_spans": ocr_info.get("ocr_spans", 0),
             "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
         },
@@ -980,15 +1496,15 @@ def extract_page_data(page: fitz.Page, page_index: int,
             "production_mark_near_misses": len(sections.get("production_mark_near_misses", [])),
             "zones_detected": len(zones),
             "page_name_detected": page_name_detected,
+            "header_detected_by_content": header_region["detected_by_content"],
             "ocr_available": TESSERACT_AVAILABLE,
             "ocr_skipped_reason": ocr_info.get("ocr_skipped_reason"),
-            "needs_review": (
-                unresolved_corruption_count > 0
-                or not page_name_detected
-                or len(sections.get("annotation_near_misses", [])) > 0
-                or len(sections.get("production_mark_near_misses", [])) > 0
-                or ocr_info.get("ocr_skipped_reason") is not None
-            ),
+            # Why, not just whether. A near-miss on a page whose header was
+            # never located is a very different thing from one on a page that
+            # extracted cleanly, and collapsing both into a single boolean left
+            # the workflow no way to tell them apart.
+            "review_reasons": review_reasons,
+            "needs_review": bool(review_reasons),
         },
     }
 
@@ -1024,11 +1540,8 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
 
     # Iterate dynamically over all pages instead of capping at 5
     for page_index in range(len(doc)):
-        if page_index in SKIP_PAGES:
-            continue
         page = doc[page_index]
-        # Provide fallback config for pages not explicitly defined in PAGE_CONFIG
-        config = PAGE_CONFIG.get(page_index, {"key": f"page{page_index+1}", "name": f"page {page_index+1}"})
+        config = page_slot(page_index)
         # Per-page isolation: one bad page must not lose the whole document
         try:
             page_data = extract_page_data(page, page_index, deadline)
@@ -1070,6 +1583,12 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         for r in [p.get("extraction_confidence", {}).get("ocr_skipped_reason")]
         if r
     })
+    review_reasons = sorted({
+        r for p in result.values()
+        for r in p.get("extraction_confidence", {}).get("review_reasons", [])
+    })
+    if failed_pages:
+        review_reasons.insert(0, "page_extraction_failed")
     result["document_meta"] = {
         "filename": filename,
         "page_count": len([k for k in result if k.startswith("page")]),
@@ -1079,14 +1598,15 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         "ocr_available": TESSERACT_AVAILABLE,
         "ocr_skip_reasons": ocr_skip_reasons,
         "extraction_seconds": elapsed,
+        "review_reasons": review_reasons,
         "needs_review": needs_review,
     }
     logger.info(
         "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d "
-        "ocr_skips=%s needs_review=%s elapsed=%.2fs",
+        "ocr_skips=%s needs_review=%s reasons=%s elapsed=%.2fs",
         filename or "<upload>", result["document_meta"]["page_count"],
         failed_pages, total_repairs, total_unresolved,
-        ocr_skip_reasons, needs_review, elapsed,
+        ocr_skip_reasons, needs_review, review_reasons, elapsed,
     )
     return result
 
@@ -1270,6 +1790,9 @@ async def health_check():
         "service": "artwork-extractor",
         "version": "2.1.0",
         "ocr_available": TESSERACT_AVAILABLE,
+        # Surfaced so a deployment can be checked without reading logs: "eng"
+        # alone on Spanish artwork means the spa pack is missing (B-09).
+        "ocr_languages": get_ocr_lang() if TESSERACT_AVAILABLE else None,
     }
 
 
@@ -1300,6 +1823,7 @@ async def root():
 @app.on_event("startup")
 async def startup_browser():
     global _playwright, _browser
+    log_ocr_status()
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
 
