@@ -455,6 +455,16 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
 
                 repaired_text, was_repaired, repair_log, corruption_confidence = repair_text(raw_text)
 
+                # TEMPORARY DEBUG (remove after diagnosing the "贸" mojibake
+                # case): log raw vs repaired bytes for any span PyMuPDF handed
+                # back with non-ASCII chars, so we can see server-side what
+                # repair_text() actually received and returned.
+                if any(ord(ch) > 127 for ch in raw_text):
+                    logger.warning(
+                        "MOJIBAKE_DEBUG raw=%r repaired=%r mojibake_run_match=%r repair_log=%r",
+                        raw_text, repaired_text, bool(MOJIBAKE_RUN.search(raw_text)), repair_log,
+                    )
+
                 # NOTE: OCR for guessed repairs happens in ocr_guessed_spans()
                 # as a bounded post-pass — never per-span in this hot loop.
 
