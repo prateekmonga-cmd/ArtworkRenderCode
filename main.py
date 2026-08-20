@@ -1817,20 +1817,6 @@ def extract_page_data(page: fitz.Page, page_index: int,
     if color_profile["inferred_annotation_colors"]:
         review_reasons.append("unknown_annotation_color")
 
-    # Canonical ACnnnV.n, synthesised once so no consumer re-derives it. Every
-    # section is passed, not just body: the on-pack instance is on the pack
-    # regardless of which bucket the header band sorted it into. Pulled out to
-    # a local so header reconstruction below can reuse it (needs the on-pack
-    # artboard bounds and the format-validity/consistency findings).
-    ac_reference_result = synthesize_ac_reference(
-        sections["header_table"], body_text_all,
-        all_spans=(sections["body"] + sections["header_table"]
-                   + sections["annotations"]
-                   + sections.get("annotation_near_misses", [])),
-        page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
-    )
-    on_pack_position = ac_reference_result.get("on_pack_position") or {}
-
     return {
         "name": detected_name,
         "sections": sections,
@@ -1843,21 +1829,15 @@ def extract_page_data(page: fitz.Page, page_index: int,
         "header_region": {
             k: v for k, v in header_region.items() if k != "threshold_pt"
         },
-        "ac_reference": ac_reference_result,
-        # Header table rebuilt purely from span/path geometry -- column
-        # boundaries, label/value pairing, row/col-pair numbers, per-cell
-        # formatting and alignment. See build_header_reconstruction's own
-        # docstring for the full algorithm.
-        "header_reconstructed": build_header_reconstruction(
-            sections["header_table"], clean_paths,
-            {
-                "page_name": detected_name,
-                "page_number": page_index + 1,
-                "page_width_mm": pt_to_mm(width_pt),
-                "page_height_mm": pt_to_mm(height_pt),
-                "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
-                "ac_reference_computed": ac_reference_result,
-            },
+        # Canonical ACnnnV.n, synthesised once so no consumer re-derives it.
+        # Every section is passed, not just body: the on-pack instance is on the
+        # pack regardless of which bucket the header band sorted it into.
+        "ac_reference": synthesize_ac_reference(
+            sections["header_table"], body_text_all,
+            all_spans=(sections["body"] + sections["header_table"]
+                       + sections["annotations"]
+                       + sections.get("annotation_near_misses", [])),
+            page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
         ),
         # Declared size vs printed callouts vs drawn geometry, reconciled once.
         "dimension_check": synthesize_dimension_check(
@@ -1939,6 +1919,7 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
                     render_dpi: int = 200) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     result = {}
+    reconstructed = {}
     failed_pages = []
     # Wall-clock guard: heavy optional work (OCR) degrades gracefully instead
     # of blowing past the platform proxy timeout and 502-ing the whole request.
@@ -1967,6 +1948,28 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
                 logger.exception(f"Page {page_index + 1} render failed ({filename})")
                 page_data["render"] = {"error": str(e)}
         result[config["key"]] = page_data
+
+        # Reconstructions rebuilt purely from this page's own extracted
+        # geometry live in their own top-level object, separate from the raw
+        # per-page extraction -- header today, artwork-level reconstruction
+        # to follow, so both land in the same place instead of each being
+        # buried inside its own page's dict.
+        if "sections" in page_data:
+            on_pack_position = (page_data.get("ac_reference") or {}).get("on_pack_position") or {}
+            dims = page_data.get("page_dimensions") or {}
+            reconstructed[config["key"]] = {
+                "header": build_header_reconstruction(
+                    page_data["sections"]["header_table"], page_data.get("paths", []),
+                    {
+                        "page_name": page_data.get("name"),
+                        "page_number": page_index + 1,
+                        "page_width_mm": dims.get("width_mm"),
+                        "page_height_mm": dims.get("height_mm"),
+                        "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
+                        "ac_reference_computed": page_data.get("ac_reference"),
+                    },
+                ),
+            }
 
     doc.close()
 
@@ -2008,6 +2011,12 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         "review_reasons": review_reasons,
         "needs_review": needs_review,
     }
+    # Kept out of the per-page dicts and out of the aggregation loops above --
+    # this is derived data, not raw extraction, and grouping every
+    # reconstruction (header now, artwork later) under one key means a
+    # consumer reads one place for "what did we rebuild" instead of one key
+    # per page per reconstruction type.
+    result["reconstructed"] = reconstructed
     logger.info(
         "Extracted %s: pages=%d failed=%s repairs=%d unresolved_corruption=%d "
         "ocr_skips=%s needs_review=%s reasons=%s elapsed=%.2fs",
