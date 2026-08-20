@@ -1292,6 +1292,393 @@ def synthesize_dimension_check(header_table: list, annotations: list,
     }
 
 
+# ═══════════════════════════════════════════════════════════════
+# HEADER TABLE RECONSTRUCTION (position-based)
+# ═══════════════════════════════════════════════════════════════
+#
+# Reconstructs the tabular header purely from drawing geometry -- no LLM
+# reading involved. Ported from the n8n "Reconstruct Header Table" Code node
+# (same algorithm, same field names) so it runs at extraction time instead of
+# as a separate downstream step, and so nothing reading its output has to
+# change shape.
+#
+# Two drawing conventions exist across artworks for the same visual table:
+# some pages draw one filled/stroked rectangle per cell (Outer Carton), others
+# draw a bare grid of horizontal/vertical line segments with no per-cell rects
+# at all (Foil). Column boundaries are reliable in both styles; row boundaries
+# are not (a grid can merge two logically separate rows, e.g. "AC Reference"
+# and "Version#", into one region with no line between them). So drawn rows
+# are never used for grouping -- only for a best-effort alignment bbox; row
+# NUMBERS reported to the caller instead come from clustering the labels' own
+# y-centers.
+#
+# Algorithm:
+#   1. Derive column x-boundaries from whichever drawing style is present
+#   2. Classify EVERY header span as a label or not, INDIVIDUALLY -- this is
+#      what keeps two different labels correctly separate even when they
+#      share a coarse drawn region
+#   3. For each label, bound its value's vertical window using the MIDPOINT
+#      between its own y-center and the next label's y-center in the same
+#      column (not either label's y0 -- a multi-line value starts higher than
+#      its single-line label to stay vertically centered against it, so a
+#      y0-anchored boundary lets the previous row swallow that line)
+#   4. Collect every non-label span in the value column whose y-center falls
+#      inside that window -- this is the value, handling multi-line wraps
+#      naturally without any fixed gap threshold
+#   5. Assign a human-readable row number (1, 2, 3...) and column-pair number
+#      (1, 2...) to every field, so "row 3, col-pair 2" points at the same
+#      cell a reviewer would point at on the printed artwork
+#   6. Report alignment (left/center/right, top/middle/bottom) from the
+#      text's own bbox against its known column width
+#   7. Attach a color swatch (fill_color_hex) if one is drawn inside the
+#      value's region (e.g. the Pantone No. rows)
+#   8. NEVER collapse mixed formatting within a value into a single value --
+#      font_name/font_size_pt/is_bold/is_italic/color_hex are reported ONLY
+#      when every span agrees; otherwise null, with mixed_formatting true and
+#      the full per-span breakdown always in spans[]
+#   9. Report the header table's own overall dimensions plus each border's
+#      distance from the page's own top-left origin, explicitly named and in
+#      both pt and mm
+#  10. Every returned block is self-identifying (page_name, page_number)
+
+RECON_FIELD_LABELS = {
+    "product name": "product_name",
+    "ac reference": "ac_reference",
+    "ac ref": "ac_reference",
+    "component type": "component_type",
+    "substrate": "substrate",
+    "pantone no": "pantone_no",
+    "artwork size": "artwork_size",
+    "flat size": "flat_size",
+    "print side": "print_side",
+    "printing side": "print_side",
+    "colour code": "colour_code",
+    "color code": "colour_code",
+    "market": "market",
+    "version": "version",
+    "dimension": "dimension",
+    "size in mm": "dimension",
+    "size lxw": "dimension",
+    "size lxwxh": "dimension",
+    "size (w)": "dimension",
+    "product code": "product_code",
+    "style": "style",
+    "barcode": "barcode",
+    "printing overlay": "printing_overlay",
+    "repeat": "repeat",
+    "printing zone": "printing_zone",
+    "dia of tube": "dia_of_tube",
+}
+
+
+def _recon_label_key(text: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[.#:]", "", (text or "").lower())).strip()
+
+
+def _recon_canonical_for(text: Optional[str]) -> Optional[str]:
+    key = _recon_label_key(text)
+    if key in RECON_FIELD_LABELS:
+        return RECON_FIELD_LABELS[key]
+    for alias, canon in RECON_FIELD_LABELS.items():
+        if key == alias or key.startswith(alias + " ") or key.endswith(" " + alias):
+            return canon
+    for alias, canon in RECON_FIELD_LABELS.items():
+        if alias in key:
+            return canon
+    return None
+
+
+def _recon_area_of(b: list) -> float:
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _recon_column_bounds(paths: list) -> Optional[list]:
+    """Column boundaries from real filled cell rects (Outer Carton) or a grid
+    of vertical line segments (Foil) -- whichever drawing style is present."""
+    rects = [p for p in (paths or [])
+             if p.get("bbox") and not p.get("fill_color_hex") and _recon_area_of(p["bbox"]) > 0]
+    v_lines = [p for p in (paths or [])
+               if p.get("bbox") and (p["bbox"][2] - p["bbox"][0]) < 1 and (p["bbox"][3] - p["bbox"][1]) > 5]
+
+    xs = set()
+    if len(rects) > 1:
+        max_area = max(_recon_area_of(r["bbox"]) for r in rects)
+        cell_rects = [r for r in rects if _recon_area_of(r["bbox"]) < max_area * 0.9]
+        for r in (cell_rects if cell_rects else rects):
+            xs.add(round(r["bbox"][0]))
+            xs.add(round(r["bbox"][2]))
+    elif len(v_lines) >= 2:
+        for l in v_lines:
+            xs.add(round(l["bbox"][0]))
+
+    sorted_xs = sorted(xs)
+    if len(sorted_xs) < 2:
+        return None  # no usable grid -- caller falls back
+    return [[sorted_xs[i], sorted_xs[i + 1]] for i in range(len(sorted_xs) - 1)]
+
+
+def _recon_border_stroke_values(paths: list) -> list:
+    """Distinct border/stroke weights of the header's own cell grid, excluding
+    the single outer border rect (its stroke can legitimately differ)."""
+    with_stroke = [p for p in (paths or [])
+                   if p.get("bbox") and isinstance(p.get("stroke_width_pt"), (int, float))
+                   and not p.get("fill_color_hex")]
+    if not with_stroke:
+        return []
+    max_area = max(_recon_area_of(r["bbox"]) for r in with_stroke)
+    inner = [r for r in with_stroke if _recon_area_of(r["bbox"]) < max_area * 0.9]
+    pool = inner if inner else with_stroke
+    return sorted({r["stroke_width_pt"] for r in pool})
+
+
+def _recon_swatch_for(bbox: list, swatches: list) -> Optional[dict]:
+    for s in swatches:
+        sb = s["bbox"]
+        if (sb[0] >= bbox[0] - 2 and sb[1] >= bbox[1] - 2
+                and sb[2] <= bbox[2] + 2 and sb[3] <= bbox[3] + 2):
+            return {"fill_color_hex": s["fill_color_hex"], "bbox": sb}
+    return None
+
+
+def _recon_span_formatting(span_details: list) -> dict:
+    def all_agree(key):
+        return all(s[key] == span_details[0][key] for s in span_details)
+
+    uniform = {k: all_agree(k) for k in ("font_name", "font_size_pt", "is_bold", "is_italic", "color_hex")}
+    mixed = not all(uniform.values())
+    first = span_details[0]
+    return {
+        "font_name": first["font_name"] if uniform["font_name"] else None,
+        "font_size_pt": first["font_size_pt"] if uniform["font_size_pt"] else None,
+        "is_bold": first["is_bold"] if uniform["is_bold"] else None,
+        "is_italic": first["is_italic"] if uniform["is_italic"] else None,
+        "color_hex": first["color_hex"] if uniform["color_hex"] else None,
+        "mixed_formatting": mixed,
+    }
+
+
+def _recon_describe_group(group_spans: list, col_bounds: Optional[list], swatches: list) -> dict:
+    sorted_spans = sorted(group_spans, key=lambda s: (s["bbox"][1], s["bbox"][0]))
+    lines = [s["text"].strip() for s in sorted_spans]
+    text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    text_bbox = [
+        min(s["bbox"][0] for s in sorted_spans), min(s["bbox"][1] for s in sorted_spans),
+        max(s["bbox"][2] for s in sorted_spans), max(s["bbox"][3] for s in sorted_spans),
+    ]
+    # Best-effort cell bbox: known column width x this group's own text extent
+    # (padded a touch). Row height isn't reliably known in the line-grid case,
+    # so vertical alignment is reported against this rather than a true row --
+    # horizontal alignment (the more commonly meaningful check) is unaffected.
+    pad = 3
+    cell_bbox = ([col_bounds[0], text_bbox[1] - pad, col_bounds[1], text_bbox[3] + pad]
+                 if col_bounds else text_bbox)
+
+    left_gap, right_gap = text_bbox[0] - cell_bbox[0], cell_bbox[2] - text_bbox[2]
+    top_gap, bottom_gap = text_bbox[1] - cell_bbox[1], cell_bbox[3] - text_bbox[3]
+    if abs(left_gap - right_gap) <= 3:
+        align_h = "center"
+    elif right_gap < left_gap:
+        align_h = "right"
+    else:
+        align_h = "left"
+    if abs(top_gap - bottom_gap) <= 3:
+        align_v = "middle"
+    elif bottom_gap < top_gap:
+        align_v = "bottom"
+    else:
+        align_v = "top"
+
+    span_details = [{
+        "text": s["text"], "bbox": s["bbox"], "font_name": s.get("font_name"),
+        "font_size_pt": s.get("font_size_pt"), "is_bold": s.get("is_bold"),
+        "is_italic": s.get("is_italic"), "color_hex": s.get("color_hex"),
+    } for s in sorted_spans]
+
+    return {
+        "text": text, "lines": lines,
+        "cell_bbox": cell_bbox, "text_bbox": text_bbox,
+        **_recon_span_formatting(span_details),
+        "spans": span_details,
+        "align_h": align_h, "align_v": align_v,
+        "swatch": _recon_swatch_for(cell_bbox, swatches),
+    }
+
+
+def _recon_col_index_for(x: float, col_bounds: list) -> int:
+    for i, (c0, c1) in enumerate(col_bounds):
+        if c0 - 2 <= x < c1 + 2:
+            return i
+    return -1
+
+
+def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict) -> dict:
+    page_meta = page_meta or {}
+    spans = [s for s in (header_spans or []) if s.get("bbox") and (s.get("text") or "").strip()]
+    if not spans:
+        return {"page_name": page_meta.get("page_name"), "page_number": page_meta.get("page_number"),
+                "pairs": [], "unassigned_spans": []}
+
+    # Scope paths to the header's own vertical extent (derived from the header
+    # spans themselves, which the extractor already separated correctly) --
+    # otherwise column detection picks up unrelated rects/lines from elsewhere
+    # on the page and produces garbage boundaries.
+    header_max_y = max(s["bbox"][3] for s in spans)
+    all_paths = [p for p in (paths or []) if p.get("bbox") and p["bbox"][1] < header_max_y + 10]
+    swatches = [p for p in all_paths if p.get("fill_color_hex")]
+    col_bounds = _recon_column_bounds(all_paths)
+
+    # Classify every span independently -- this is what stops two genuinely
+    # different labels (e.g. AC Reference / Version#) from being merged just
+    # because they happen to share a coarse drawn region.
+    labeled, plain = [], []
+    for span in spans:
+        canon = _recon_canonical_for(span["text"])
+        col = _recon_col_index_for((span["bbox"][0] + span["bbox"][2]) / 2, col_bounds) if col_bounds else -1
+        if canon:
+            labeled.append({"span": span, "canon": canon, "col": col})
+        else:
+            plain.append({"span": span, "col": col})
+
+    by_label_col = {}
+    for l in labeled:
+        by_label_col.setdefault(l["col"], []).append(l)
+    for group in by_label_col.values():
+        group.sort(key=lambda l: l["span"]["bbox"][1])
+
+    def y_center(span):
+        return (span["bbox"][1] + span["bbox"][3]) / 2
+
+    def window_for(l):
+        siblings = by_label_col.get(l["col"], [l])
+        idx = siblings.index(l)
+        prev = siblings[idx - 1] if idx - 1 >= 0 else None
+        nxt = siblings[idx + 1] if idx + 1 < len(siblings) else None
+        window_start = (y_center(prev["span"]) + y_center(l["span"])) / 2 if prev else float("-inf")
+        window_end = (y_center(l["span"]) + y_center(nxt["span"])) / 2 if nxt else float("inf")
+        return window_start, window_end
+
+    # Row number (1, 2, 3...) and column-pair number (1, 2...) for each field,
+    # so a reviewer can point at "row 1, col-pair 2" the same way they'd point
+    # at the printed table, without having to read raw pt coordinates.
+    row_tolerance_pt = 8
+    row_centers = sorted(y_center(l["span"]) for l in labeled)
+    row_clusters = []
+    for c in row_centers:
+        if not row_clusters or c - row_clusters[-1] > row_tolerance_pt:
+            row_clusters.append(c)
+
+    def row_number_for(span):
+        c = y_center(span)
+        best, best_dist = 0, float("inf")
+        for i, rc in enumerate(row_clusters):
+            d = abs(rc - c)
+            if d < best_dist:
+                best_dist, best = d, i
+        return best + 1
+
+    # "Row count" for compliance purposes (e.g. a spec requiring exactly N
+    # rows) is counted from the LEFT-MOST column only, not every label on the
+    # page. A right-hand column can split into an extra sub-row that has no
+    # corresponding split on the left -- that is one row as printed, not two,
+    # and counting every label globally conflated the two, overcounting by
+    # exactly the number of such splits.
+    left_col_centers = sorted(y_center(l["span"]) for l in labeled if l["col"] == 0)
+    left_col_clusters = []
+    for c in left_col_centers:
+        if not left_col_clusters or c - left_col_clusters[-1] > row_tolerance_pt:
+            left_col_clusters.append(c)
+    row_count = len(left_col_clusters) or len(row_clusters)
+
+    pairs = []
+    claimed_value_spans = set()
+    for l in labeled:
+        window_start, window_end = window_for(l)
+        value_col = l["col"] + 1
+        value_spans = sorted(
+            (p["span"] for p in plain
+             if p["col"] == value_col and window_start <= y_center(p["span"]) < window_end),
+            key=lambda s: (s["bbox"][1], s["bbox"][0]),
+        )
+        for vs in value_spans:
+            claimed_value_spans.add(id(vs))
+
+        label_col = col_bounds[l["col"]] if col_bounds and l["col"] >= 0 else None
+        val_col = (col_bounds[value_col] if col_bounds and l["col"] >= 0 and value_col < len(col_bounds)
+                   else None)
+
+        pairs.append({
+            "row": row_number_for(l["span"]),
+            "col_pair": (l["col"] // 2) + 1 if l["col"] >= 0 else None,
+            "canonical": l["canon"],
+            "label": _recon_describe_group([l["span"]], label_col, swatches),
+            "value": _recon_describe_group(value_spans, val_col, swatches) if value_spans else None,
+        })
+    pairs.sort(key=lambda p: (p["row"], p["col_pair"] or 0))
+
+    unassigned = [p["span"]["text"] for p in plain if id(p["span"]) not in claimed_value_spans]
+
+    # Overall table extent -- the header table's own dimensions on the page,
+    # not any individual cell's -- plus each border's distance from the page's
+    # own top-left origin, explicitly named for compliance checks:
+    #   left_from_page_left_pt/mm    -- table's left border
+    #   right_from_page_left_pt/mm   -- table's right border (also measured
+    #                                    from the page's LEFT edge)
+    #   top_from_page_top_pt/mm      -- table's top border
+    #   bottom_from_page_top_pt/mm   -- table's bottom border (also measured
+    #                                    from the page's TOP edge)
+    all_x0 = [s["bbox"][0] for s in spans]
+    all_x1 = [s["bbox"][2] for s in spans]
+    all_y0 = [s["bbox"][1] for s in spans]
+    all_y1 = [s["bbox"][3] for s in spans]
+    table_bbox = [min(all_x0), min(all_y0), max(all_x1), max(all_y1)]
+
+    has_mm = all(isinstance(s.get("bbox_mm"), list) for s in spans)
+    table_bbox_mm = None
+    if has_mm:
+        mm_x0 = [s["bbox_mm"][0] for s in spans]
+        mm_x1 = [s["bbox_mm"][2] for s in spans]
+        mm_y0 = [s["bbox_mm"][1] for s in spans]
+        mm_y1 = [s["bbox_mm"][3] for s in spans]
+        table_bbox_mm = [min(mm_x0), min(mm_y0), max(mm_x1), max(mm_y1)]
+
+    return {
+        "page_name": page_meta.get("page_name"),
+        "page_number": page_meta.get("page_number"),
+        "pairs": pairs,
+        "unassigned_spans": unassigned,
+        "table_bbox": table_bbox,
+        "table_bbox_mm": table_bbox_mm,
+        "table_width_pt": table_bbox[2] - table_bbox[0],
+        "table_height_pt": table_bbox[3] - table_bbox[1],
+        "table_width_mm": (table_bbox_mm[2] - table_bbox_mm[0]) if table_bbox_mm else None,
+        "table_height_mm": (table_bbox_mm[3] - table_bbox_mm[1]) if table_bbox_mm else None,
+        "left_from_page_left_pt": table_bbox[0],
+        "right_from_page_left_pt": table_bbox[2],
+        "top_from_page_top_pt": table_bbox[1],
+        "bottom_from_page_top_pt": table_bbox[3],
+        "left_from_page_left_mm": table_bbox_mm[0] if table_bbox_mm else None,
+        "right_from_page_left_mm": table_bbox_mm[2] if table_bbox_mm else None,
+        "top_from_page_top_mm": table_bbox_mm[1] if table_bbox_mm else None,
+        "bottom_from_page_top_mm": table_bbox_mm[3] if table_bbox_mm else None,
+        "row_count": row_count,
+        "column_count": len(col_bounds) if col_bounds else None,
+        "col_pair_count": math.ceil(len(col_bounds) / 2) if col_bounds else None,
+        "border_stroke_pt": _recon_border_stroke_values(all_paths),
+        # Passed through for downstream compliance checks that need the
+        # page's own geometry (e.g. horizontal-centering) alongside the
+        # header's own -- not re-derived here since it's already computed.
+        "page_width_mm": page_meta.get("page_width_mm"),
+        "page_height_mm": page_meta.get("page_height_mm"),
+        "artboard_bounds_mm": page_meta.get("artboard_bounds_mm"),
+        # Passed through as-is for rule 1-43: header_combined (format validity
+        # -- only set when both the AC number and version resolve to their
+        # required shape) and consistent (does the on-pack rotated instance
+        # match the header-derived value) are already computed by
+        # synthesize_ac_reference; no reason to re-derive them here.
+        "ac_reference_computed": page_meta.get("ac_reference_computed"),
+    }
+
+
 def extract_page_data(page: fitz.Page, page_index: int,
                       deadline: Optional[float] = None) -> dict:
     """Extract all data from a single page with enhanced features."""
@@ -1430,6 +1817,20 @@ def extract_page_data(page: fitz.Page, page_index: int,
     if color_profile["inferred_annotation_colors"]:
         review_reasons.append("unknown_annotation_color")
 
+    # Canonical ACnnnV.n, synthesised once so no consumer re-derives it. Every
+    # section is passed, not just body: the on-pack instance is on the pack
+    # regardless of which bucket the header band sorted it into. Pulled out to
+    # a local so header reconstruction below can reuse it (needs the on-pack
+    # artboard bounds and the format-validity/consistency findings).
+    ac_reference_result = synthesize_ac_reference(
+        sections["header_table"], body_text_all,
+        all_spans=(sections["body"] + sections["header_table"]
+                   + sections["annotations"]
+                   + sections.get("annotation_near_misses", [])),
+        page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
+    )
+    on_pack_position = ac_reference_result.get("on_pack_position") or {}
+
     return {
         "name": detected_name,
         "sections": sections,
@@ -1442,15 +1843,21 @@ def extract_page_data(page: fitz.Page, page_index: int,
         "header_region": {
             k: v for k, v in header_region.items() if k != "threshold_pt"
         },
-        # Canonical ACnnnV.n, synthesised once so no consumer re-derives it.
-        # Every section is passed, not just body: the on-pack instance is on the
-        # pack regardless of which bucket the header band sorted it into.
-        "ac_reference": synthesize_ac_reference(
-            sections["header_table"], body_text_all,
-            all_spans=(sections["body"] + sections["header_table"]
-                       + sections["annotations"]
-                       + sections.get("annotation_near_misses", [])),
-            page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
+        "ac_reference": ac_reference_result,
+        # Header table rebuilt purely from span/path geometry -- column
+        # boundaries, label/value pairing, row/col-pair numbers, per-cell
+        # formatting and alignment. See build_header_reconstruction's own
+        # docstring for the full algorithm.
+        "header_reconstructed": build_header_reconstruction(
+            sections["header_table"], clean_paths,
+            {
+                "page_name": detected_name,
+                "page_number": page_index + 1,
+                "page_width_mm": pt_to_mm(width_pt),
+                "page_height_mm": pt_to_mm(height_pt),
+                "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
+                "ac_reference_computed": ac_reference_result,
+            },
         ),
         # Declared size vs printed callouts vs drawn geometry, reconciled once.
         "dimension_check": synthesize_dimension_check(
