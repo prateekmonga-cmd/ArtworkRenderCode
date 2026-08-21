@@ -364,6 +364,127 @@ COLUMN_WIDTH_PT = 40          # ≈14 mm; column bucket width for sorting/spacin
 SPACING_SIZE_TOLERANCE = 0.25  # ±25% font size — beyond this it's a new block
 
 
+# ─── Character-level geometry for alignment rules ────────────
+# Several SOP requirements are about *alignment*, not content: the batch-coding
+# and registration colons must line up vertically (§2.3.x), and composition
+# claims plus "q.s." must be "perfectly right-aligned in a straight vertical
+# line" (§1.3.4). Neither is answerable from the span bbox:
+#
+#   - the bbox includes trailing whitespace, so its right edge is not where the
+#     visible text ends. Measured on real spans: "Código     : " and
+#     "Vence       : " carry 2.5 pt (0.88 mm) of trailing-space inflation while
+#     "Fecha Fab:" carries none, which alone is ~9x the tolerance these rules
+#     imply — comparing raw x1 values would invent misalignment that isn't there
+#     and hide misalignment that is;
+#   - a colon in the middle of a span ("India; Para: Rhydburg LLP, India") has
+#     no derivable position at all.
+#
+# rawdict already returns a bbox per character; the extractor was reading only
+# the character itself and dropping the geometry. Only alignment-relevant
+# anchors are kept — emitting every character would multiply the payload many
+# times over for data no rule reads. Note the public "bbox" field is snapped to
+# whole points (snap_coord), far too coarse here, so these are all derived from
+# the unrounded boxes via bbox_to_mm (0.01 mm).
+
+ALIGNMENT_CHARS = (":",)
+SEGMENT_GAP_MIN = 2   # 2+ consecutive spaces reads as a column break, not a word space
+
+
+def _visible(chars: list) -> list:
+    return [c for c in chars if (c.get("c") or "").strip()]
+
+
+def _char_segments(chars: list) -> list:
+    """Split a span on runs of 2+ spaces — the artwork's own column separator.
+
+    "Loratadina                    10 mg" is one span, but it is really two
+    columns: the salt name and its claim. The claim's own right edge is what
+    §1.3.4 requires to be aligned, and it is invisible without this split.
+    """
+    segments = []
+    text_parts: list = []
+    boxes: list = []
+    gap = 0
+
+    def flush():
+        if boxes:
+            segments.append({
+                "text": "".join(text_parts).strip(),
+                "bbox_mm": bbox_to_mm((
+                    min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[2] for b in boxes), max(b[3] for b in boxes),
+                )),
+            })
+        text_parts.clear()
+        boxes.clear()
+
+    for ch in chars:
+        char = ch.get("c") or ""
+        box = ch.get("bbox")
+        if not char.strip():
+            gap += 1
+            continue
+        if gap >= SEGMENT_GAP_MIN:
+            flush()
+        elif gap == 1 and text_parts:
+            text_parts.append(" ")   # ordinary word space, stays in the segment
+        gap = 0
+        text_parts.append(char)
+        if box:
+            boxes.append(box)
+    flush()
+    return segments
+
+
+def char_alignment_geometry(chars: list, span_bbox) -> dict:
+    """Alignment anchors for one span, derived from its per-character boxes.
+
+    Only keys that carry information are returned: a span with no colon gets no
+    "colons", a span with no internal column gap gets no "segments", and
+    "visible_bbox_mm" appears only when whitespace actually moved an edge — so
+    the common case (a plain span) adds nothing to the payload.
+    """
+    if not chars:
+        return {}
+
+    out = {}
+    vis = _visible(chars)
+    boxed = [c for c in vis if c.get("bbox")]
+    if boxed:
+        visible_bbox = (
+            min(c["bbox"][0] for c in boxed), min(c["bbox"][1] for c in boxed),
+            max(c["bbox"][2] for c in boxed), max(c["bbox"][3] for c in boxed),
+        )
+        # Only worth reporting when it differs from the span's own box; equal
+        # boxes would just duplicate bbox_mm on every span on the page.
+        if span_bbox is None or any(
+            abs(a - b) > 0.01 for a, b in zip(visible_bbox, tuple(span_bbox))
+        ):
+            out["visible_bbox_mm"] = bbox_to_mm(visible_bbox)
+
+    colons = []
+    for i, ch in enumerate(chars):
+        if (ch.get("c") or "") in ALIGNMENT_CHARS and ch.get("bbox"):
+            b = ch["bbox"]
+            colons.append({
+                "char": ch["c"],
+                "index": i,
+                "bbox_mm": bbox_to_mm(b),
+                # x0 is the anchor an alignment check compares across rows --
+                # glyph widths differ, so left edges line up where right edges
+                # need not.
+                "x0_mm": pt_to_mm(b[0]),
+            })
+    if colons:
+        out["colons"] = colons
+
+    segments = _char_segments(chars)
+    if len(segments) > 1:
+        out["segments"] = segments
+
+    return out
+
+
 def compute_line_spacing(body_spans: list) -> None:
     """Attach line_spacing to each body span, in place.
 
@@ -540,6 +661,15 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
                     # spacing check.
                     "_y0": bbox[1], "_y1": bbox[3], "_size": raw_size,
                 }
+
+                # Alignment anchors (colon positions, column segments, the
+                # whitespace-free box). Derived from the raw glyph boxes, so it
+                # reflects where ink actually sits regardless of any text repair
+                # applied above. Omitted entirely when the span has nothing
+                # alignment-relevant in it.
+                alignment = char_alignment_geometry(chars, bbox)
+                if alignment:
+                    span_data["alignment"] = alignment
 
                 if in_header:
                     header_table.append(span_data)
@@ -1293,6 +1423,203 @@ def synthesize_dimension_check(header_table: list, annotations: list,
 
 
 # ═══════════════════════════════════════════════════════════════
+# BARCODE DECODING (from the drawn bars, not OCR)
+# ═══════════════════════════════════════════════════════════════
+#
+# Rule 1-48 wants three barcode values compared: the header cell, the Art
+# Creation record, and "the actual barcode graphic's underlying value". The
+# third was unavailable -- the human-readable caption under the bars is not
+# text. Probing the real artwork showed why: the caption is one filled drawing
+# of 319 items, 288 of them CURVES, i.e. the digits were converted to outlines.
+# There is no glyph and no barcode font on the page, so no text-extraction mode
+# can ever read it.
+#
+# OCR would be the obvious fallback and is the wrong tool. The bars themselves
+# are 30 filled rectangles, and EAN-13 is a fixed 95-module encoding, so the
+# value can be recovered by arithmetic: exact, no Tesseract dependency, no
+# confidence threshold, and it yields what a SCANNER would read rather than what
+# a human sees printed -- the stronger reading of the rule, and the only one
+# that catches bars and caption disagreeing.
+#
+# Verified against the real artwork: decoded 8908001212069 with valid check
+# digit, matching the Art Creation record and mismatching the header cell
+# (…2096), which is where the actual defect is.
+
+# 95 modules: 3 start guard | 6x7 left | 5 centre guard | 6x7 right | 3 end guard
+EAN13_MODULES = 95
+EAN13_MIN_BARS = 20          # a real EAN-13 draws 30; fewer means it isn't one
+EAN13_NOMINAL_MODULE_MM = 0.33   # module width at 100% magnification (GS1)
+
+# Left-hand digits carry the leading digit in their parity choice: L (odd) or
+# G (even). Right-hand digits use R, the complement of L.
+_EAN_L = {"0001101": 0, "0011001": 1, "0010011": 2, "0111101": 3, "0100011": 4,
+          "0110001": 5, "0101111": 6, "0111011": 7, "0110111": 8, "0001011": 9}
+_EAN_G = {"0100111": 0, "0110011": 1, "0011011": 2, "0100001": 3, "0011101": 4,
+          "0111001": 5, "0000101": 6, "0010001": 7, "0001001": 8, "0010111": 9}
+_EAN_R = {"1110010": 0, "1100110": 1, "1101100": 2, "1000010": 3, "1011100": 4,
+          "1001110": 5, "1010000": 6, "1000100": 7, "1001000": 8, "1110100": 9}
+_EAN_FIRST = {"000000": 0, "001011": 1, "001101": 2, "001110": 3, "010011": 4,
+              "011001": 5, "011100": 6, "010101": 7, "010110": 8, "011010": 9}
+
+
+def _ean13_check_digit(twelve: str) -> int:
+    total = sum(int(c) * (3 if i % 2 else 1) for i, c in enumerate(twelve))
+    return (10 - total % 10) % 10
+
+
+def _decode_ean13_bars(bars: list) -> dict:
+    """Decode a left-to-right sorted list of bar (x0, x1) pairs."""
+    x0, x1 = bars[0][0], bars[-1][1]
+    span = x1 - x0
+    if span <= 0:
+        return {"value": None, "reason": "zero-width bar block"}
+    module = span / EAN13_MODULES
+
+    # Sample each module at its centre -- robust against sub-point rounding in
+    # the bar edges, which a run-length walk would accumulate.
+    pattern = "".join(
+        "1" if any(b[0] - 1e-6 <= x0 + (i + 0.5) * module <= b[1] + 1e-6 for b in bars)
+        else "0"
+        for i in range(EAN13_MODULES)
+    )
+
+    guards_ok = (pattern[:3] == "101" and pattern[45:50] == "01010"
+                 and pattern[92:] == "101")
+    if not guards_ok:
+        return {"value": None, "reason": "guard patterns do not match EAN-13",
+                "module_pattern": pattern}
+
+    parity, left_digits = "", []
+    for i in range(6):
+        chunk = pattern[3 + i * 7: 10 + i * 7]
+        if chunk in _EAN_L:
+            parity += "0"
+            left_digits.append(_EAN_L[chunk])
+        elif chunk in _EAN_G:
+            parity += "1"
+            left_digits.append(_EAN_G[chunk])
+        else:
+            return {"value": None, "reason": f"unrecognised left chunk {chunk}",
+                    "module_pattern": pattern}
+
+    right_digits = []
+    for i in range(6):
+        chunk = pattern[50 + i * 7: 57 + i * 7]
+        if chunk not in _EAN_R:
+            return {"value": None, "reason": f"unrecognised right chunk {chunk}",
+                    "module_pattern": pattern}
+        right_digits.append(_EAN_R[chunk])
+
+    first = _EAN_FIRST.get(parity)
+    if first is None:
+        return {"value": None, "reason": f"parity {parity} is not a valid leading digit",
+                "module_pattern": pattern}
+
+    code = str(first) + "".join(str(d) for d in left_digits + right_digits)
+    expected = _ean13_check_digit(code[:12])
+    return {
+        "value": code,
+        "symbology": "EAN-13",
+        "check_digit_valid": expected == int(code[12]),
+        "check_digit_expected": expected,
+        "module_width_pt": round(module, 4),
+    }
+
+
+BAR_MIN_HEIGHT_PT = 4.0      # shorter filled slivers are rules, ticks or glyph parts
+BAR_TOP_EPS_PT = 1.0         # bars of one symbol share a top edge this closely
+BAR_GAP_FACTOR = 12.0        # a horizontal gap this many bar-widths wide separates symbols
+
+
+def decode_barcodes(raw_drawings: Optional[list]) -> list:
+    """Find and decode barcode graphics on a page.
+
+    Bars are collected PAGE-WIDE rather than per drawing. Grouping varies by
+    how the artwork was produced: AC2491 draws all 30 bars inside one compound
+    drawing, while AC2475/AC3146 spread the same 30 bars across separate
+    drawing objects. An earlier version required one drawing to hold them all
+    and therefore reported "no barcode" for the latter -- on artworks whose
+    header declares a barcode, which would have read as a compliance defect
+    that did not exist.
+
+    Bars are then clustered by their shared TOP edge, not their full box: the
+    guard bars of an EAN-13 are drawn longer than the data bars, so bottoms
+    legitimately differ within one symbol.
+
+    Candidates that cannot be decoded are still reported, with a reason -- a
+    barcode we failed to read is a finding, not something to omit silently.
+    """
+    candidates = []
+    for drawing in (raw_drawings or []):
+        # Filled only. Stroked rects are table borders and dielines.
+        if drawing.get("type") not in ("f", "fs"):
+            continue
+        for it in (drawing.get("items") or []):
+            if it[0] != "re":
+                continue
+            r = fitz.Rect(it[1])
+            w, h = r.x1 - r.x0, r.y1 - r.y0
+            if w > 0 and h > w and h >= BAR_MIN_HEIGHT_PT:
+                candidates.append(r)
+
+    # Cluster by shared top edge.
+    bands: list = []
+    for r in sorted(candidates, key=lambda r: (r.y0, r.x0)):
+        for band in bands:
+            if abs(band[0].y0 - r.y0) <= BAR_TOP_EPS_PT:
+                band.append(r)
+                break
+        else:
+            bands.append([r])
+
+    results = []
+    for band in bands:
+        band.sort(key=lambda r: r.x0)
+        # Split a band into runs, so two symbols side by side at the same height
+        # are not merged into one nonsense pattern.
+        widths = sorted(r.x1 - r.x0 for r in band)
+        typical = widths[len(widths) // 2] or 1.0
+        runs, current = [], [band[0]]
+        for prev, nxt in zip(band, band[1:]):
+            if nxt.x0 - prev.x1 > typical * BAR_GAP_FACTOR:
+                runs.append(current)
+                current = [nxt]
+            else:
+                current.append(nxt)
+        runs.append(current)
+
+        for run in runs:
+            if len(run) < EAN13_MIN_BARS:
+                continue
+            block = fitz.Rect(run[0].x0, min(r.y0 for r in run),
+                              run[-1].x1, max(r.y1 for r in run))
+            entry = {
+                "bar_count": len(run),
+                "bbox_mm": bbox_to_mm(block),
+                "width_mm": pt_to_mm(block.x1 - block.x0),
+                "height_mm": pt_to_mm(block.y1 - block.y0),
+            }
+            entry.update(_decode_ean13_bars([(r.x0, r.x1) for r in run]))
+
+            mw = entry.get("module_width_pt")
+            if mw:
+                # Not pt_to_mm here: it rounds to 2 decimals, which turns a
+                # 0.0782 mm module into 0.08 and skews the magnification below
+                # by half a percent. A module is sub-0.1 mm, so it needs digits.
+                module_mm = mw * PT_TO_MM
+                entry["module_width_mm"] = round(module_mm, 4)
+                # Printed size relative to the GS1 nominal. Scannability depends
+                # on this, so it is reported as measured data for a size rule to
+                # judge -- no threshold is applied here.
+                entry["magnification_percent"] = round(
+                    module_mm / EAN13_NOMINAL_MODULE_MM * 100, 1)
+            results.append(entry)
+
+    results.sort(key=lambda e: (e["bbox_mm"][1], e["bbox_mm"][0]) if e.get("bbox_mm") else (0, 0))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
 # HEADER TABLE RECONSTRUCTION (position-based)
 # ═══════════════════════════════════════════════════════════════
 #
@@ -1392,29 +1719,153 @@ def _recon_area_of(b: list) -> float:
     return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
 
-def _recon_column_bounds(paths: list) -> Optional[list]:
-    """Column boundaries from real filled cell rects (Outer Carton) or a grid
-    of vertical line segments (Foil) -- whichever drawing style is present."""
-    rects = [p for p in (paths or [])
-             if p.get("bbox") and not p.get("fill_color_hex") and _recon_area_of(p["bbox"]) > 0]
-    v_lines = [p for p in (paths or [])
-               if p.get("bbox") and (p["bbox"][2] - p["bbox"][0]) < 1 and (p["bbox"][3] - p["bbox"][1]) > 5]
+# Tolerance for treating two drawn edges as the same grid line. Real headers
+# land within ~0.05 pt of each other; 0.5 pt is loose enough to absorb that
+# without merging genuinely distinct 6 pt rows.
+GRID_EPS_PT = 0.5
+GRID_MIN_LINE_PT = 5.0     # shorter than this is a tick or a swatch edge, not a rule
 
-    xs = set()
+
+def _dedupe_edges(values: list, eps: float = GRID_EPS_PT) -> list:
+    out = []
+    for v in sorted(values):
+        if not out or v - out[-1] > eps:
+            out.append(v)
+    return out
+
+
+def _header_grid(paths: list) -> dict:
+    """Recover the header table's drawn cell grid.
+
+    Two conventions appear in real artwork and both are handled:
+
+      rects  (Outer Carton) -- one stroked rectangle per cell, plus one outer
+             border. Merged cells are drawn as a single taller rect, so the
+             rects themselves carry the merge information and must be used
+             as-is rather than re-derived from edges.
+
+      lines  (Foil) -- a bare ruled grid with no per-cell rects. Cells are
+             implied by the lines, and a PARTIAL rule (one spanning only part
+             of the table width) splits only the columns it actually crosses:
+             the Foil's 90 mm rule at y=23.76 divides AC Reference from
+             Version# on the right half while the left half stays one tall row.
+
+    Everything here is measured off the drawn geometry, never off text -- the
+    text sits inside its cell, so text extent understates the table (measured:
+    176.96 x 47.06 against a real 180.00 x 48.00).
+    """
+    usable = [p for p in (paths or []) if p.get("bbox")]
+    stroked = [p for p in usable if not p.get("fill_color_hex")]
+
+    rects = [p for p in stroked
+             if (p["bbox"][2] - p["bbox"][0]) > GRID_EPS_PT
+             and (p["bbox"][3] - p["bbox"][1]) > GRID_EPS_PT]
+    h_lines = [p for p in stroked
+               if (p["bbox"][3] - p["bbox"][1]) <= GRID_EPS_PT
+               and (p["bbox"][2] - p["bbox"][0]) > GRID_MIN_LINE_PT]
+    v_lines = [p for p in stroked
+               if (p["bbox"][2] - p["bbox"][0]) <= GRID_EPS_PT
+               and (p["bbox"][3] - p["bbox"][1]) > GRID_MIN_LINE_PT]
+
+    empty = {"convention": None, "table_bbox": None, "table_bbox_mm": None,
+             "cells": [], "col_edges": [], "border_stroke_pt": []}
+
+    def _mm_extent(sources: list) -> Optional[list]:
+        """Millimetre extent taken from the paths' own bbox_mm.
+
+        The public "bbox" is snapped to whole points, which is fine for deciding
+        which cell owns a span but not for a size the spec checks: 180 mm is
+        510.24 pt, snaps to 510, and reads back as 179.92 mm -- a 0.08 mm error
+        invented by rounding. bbox_mm is derived from the unsnapped rect.
+        """
+        boxed = [p for p in sources if isinstance(p.get("bbox_mm"), list)]
+        if not boxed:
+            return None
+        return [
+            min(p["bbox_mm"][0] for p in boxed), min(p["bbox_mm"][1] for p in boxed),
+            max(p["bbox_mm"][2] for p in boxed), max(p["bbox_mm"][3] for p in boxed),
+        ]
+
     if len(rects) > 1:
-        max_area = max(_recon_area_of(r["bbox"]) for r in rects)
-        cell_rects = [r for r in rects if _recon_area_of(r["bbox"]) < max_area * 0.9]
-        for r in (cell_rects if cell_rects else rects):
-            xs.add(round(r["bbox"][0]))
-            xs.add(round(r["bbox"][2]))
-    elif len(v_lines) >= 2:
-        for l in v_lines:
-            xs.add(round(l["bbox"][0]))
+        outer = max(rects, key=lambda r: _recon_area_of(r["bbox"]))
+        table_bbox = list(outer["bbox"])
+        cells = [list(r["bbox"]) for r in rects if r is not outer]
+        if not cells:
+            return empty
+        strokes = sorted({r["stroke_width_pt"] for r in rects if r is not outer
+                          if isinstance(r.get("stroke_width_pt"), (int, float))})
+        return {
+            "convention": "rects",
+            "table_bbox": table_bbox,
+            "table_bbox_mm": _mm_extent([outer]),
+            "cells": cells,
+            "col_edges": _dedupe_edges([c[0] for c in cells] + [c[2] for c in cells]),
+            "border_stroke_pt": strokes,
+        }
 
-    sorted_xs = sorted(xs)
-    if len(sorted_xs) < 2:
-        return None  # no usable grid -- caller falls back
-    return [[sorted_xs[i], sorted_xs[i + 1]] for i in range(len(sorted_xs) - 1)]
+    if len(v_lines) >= 2 and h_lines:
+        col_edges = _dedupe_edges([l["bbox"][0] for l in v_lines])
+        # The verticals span the table's full height, so they define top and
+        # bottom -- the horizontals only tell us where rows divide, and the
+        # bottom-most rule is not necessarily the table's bottom edge.
+        top = min(l["bbox"][1] for l in v_lines)
+        bottom = max(l["bbox"][3] for l in v_lines)
+        table_bbox = [col_edges[0], top, col_edges[-1], bottom]
+
+        cells = []
+        for ci in range(len(col_edges) - 1):
+            cx0, cx1 = col_edges[ci], col_edges[ci + 1]
+            mid_x = (cx0 + cx1) / 2
+            # Only rules that actually cross this column can divide it.
+            ys = [top, bottom]
+            for l in h_lines:
+                b = l["bbox"]
+                if b[0] - GRID_EPS_PT <= mid_x <= b[2] + GRID_EPS_PT:
+                    ys.append(b[1])
+            ys = _dedupe_edges([y for y in ys if top - GRID_EPS_PT <= y <= bottom + GRID_EPS_PT])
+            for ri in range(len(ys) - 1):
+                cells.append([cx0, ys[ri], cx1, ys[ri + 1]])
+
+        strokes = sorted({l["stroke_width_pt"] for l in (h_lines + v_lines)
+                          if isinstance(l.get("stroke_width_pt"), (int, float))})
+        return {
+            "convention": "lines",
+            "table_bbox": table_bbox,
+            # The verticals bound the table on all four sides here, so their
+            # own mm extent is the table's.
+            "table_bbox_mm": _mm_extent(v_lines),
+            "cells": cells,
+            "col_edges": col_edges,
+            "border_stroke_pt": strokes,
+        }
+
+    return empty
+
+
+def _cell_containing(bbox: list, cells: list) -> Optional[list]:
+    """Smallest drawn cell containing a text box's centre.
+
+    Smallest, not first: in the rects convention the outer border was already
+    dropped, but a merged cell can still enclose a neighbour's area, and the
+    tighter cell is always the right owner.
+    """
+    if not cells or not bbox:
+        return None
+    cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    best = None
+    for c in cells:
+        if (c[0] - GRID_EPS_PT <= cx <= c[2] + GRID_EPS_PT
+                and c[1] - GRID_EPS_PT <= cy <= c[3] + GRID_EPS_PT):
+            if best is None or _recon_area_of(c) < _recon_area_of(best):
+                best = c
+    return list(best) if best else None
+
+
+def _recon_column_bounds_from_grid(grid: dict) -> Optional[list]:
+    edges = grid.get("col_edges") or []
+    if len(edges) < 2:
+        return None
+    return [[edges[i], edges[i + 1]] for i in range(len(edges) - 1)]
 
 
 def _recon_border_stroke_values(paths: list) -> list:
@@ -1457,7 +1908,8 @@ def _recon_span_formatting(span_details: list) -> dict:
     }
 
 
-def _recon_describe_group(group_spans: list, col_bounds: Optional[list], swatches: list) -> dict:
+def _recon_describe_group(group_spans: list, cell_bbox: Optional[list],
+                          swatches: list, col_bounds: Optional[list] = None) -> dict:
     sorted_spans = sorted(group_spans, key=lambda s: (s["bbox"][1], s["bbox"][0]))
     lines = [s["text"].strip() for s in sorted_spans]
     text = re.sub(r"\s+", " ", " ".join(lines)).strip()
@@ -1465,13 +1917,18 @@ def _recon_describe_group(group_spans: list, col_bounds: Optional[list], swatche
         min(s["bbox"][0] for s in sorted_spans), min(s["bbox"][1] for s in sorted_spans),
         max(s["bbox"][2] for s in sorted_spans), max(s["bbox"][3] for s in sorted_spans),
     ]
-    # Best-effort cell bbox: known column width x this group's own text extent
-    # (padded a touch). Row height isn't reliably known in the line-grid case,
-    # so vertical alignment is reported against this rather than a true row --
-    # horizontal alignment (the more commonly meaningful check) is unaffected.
-    pad = 3
-    cell_bbox = ([col_bounds[0], text_bbox[1] - pad, col_bounds[1], text_bbox[3] + pad]
-                 if col_bounds else text_bbox)
+    # cell_bbox is the cell as actually DRAWN, looked up from the grid, so
+    # vertical alignment is measured against the real row -- not, as before, a
+    # +/-3 pt pad around the text, which made align_v self-fulfilling (text
+    # padded symmetrically always reads "middle").
+    cell_source = "drawn_cell"
+    if not cell_bbox:
+        # No grid recovered for this group. Fall back to the column width where
+        # one is known so horizontal alignment still means something, and mark
+        # the row extent as unknown rather than inventing one.
+        cell_source = "column_only" if col_bounds else "text_extent"
+        cell_bbox = ([col_bounds[0], text_bbox[1], col_bounds[1], text_bbox[3]]
+                     if col_bounds else list(text_bbox))
 
     left_gap, right_gap = text_bbox[0] - cell_bbox[0], cell_bbox[2] - text_bbox[2]
     top_gap, bottom_gap = text_bbox[1] - cell_bbox[1], cell_bbox[3] - text_bbox[3]
@@ -1481,7 +1938,12 @@ def _recon_describe_group(group_spans: list, col_bounds: Optional[list], swatche
         align_h = "right"
     else:
         align_h = "left"
-    if abs(top_gap - bottom_gap) <= 3:
+    # Only meaningful against a real row. Without one the cell's vertical
+    # extent IS the text's, so every group would read "middle" -- report
+    # nothing rather than a value that is true by construction.
+    if cell_source != "drawn_cell":
+        align_v = None
+    elif abs(top_gap - bottom_gap) <= 3:
         align_v = "middle"
     elif bottom_gap < top_gap:
         align_v = "bottom"
@@ -1496,7 +1958,11 @@ def _recon_describe_group(group_spans: list, col_bounds: Optional[list], swatche
 
     return {
         "text": text, "lines": lines,
-        "cell_bbox": cell_bbox, "text_bbox": text_bbox,
+        "cell_bbox": cell_bbox,
+        "cell_bbox_mm": bbox_to_mm(cell_bbox),
+        "cell_source": cell_source,
+        "text_bbox": text_bbox,
+        "text_bbox_mm": bbox_to_mm(text_bbox),
         **_recon_span_formatting(span_details),
         "spans": span_details,
         "align_h": align_h, "align_v": align_v,
@@ -1525,7 +1991,9 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
     header_max_y = max(s["bbox"][3] for s in spans)
     all_paths = [p for p in (paths or []) if p.get("bbox") and p["bbox"][1] < header_max_y + 10]
     swatches = [p for p in all_paths if p.get("fill_color_hex")]
-    col_bounds = _recon_column_bounds(all_paths)
+    grid = _header_grid(all_paths)
+    col_bounds = _recon_column_bounds_from_grid(grid)
+    cells = grid.get("cells") or []
 
     # Classify every span independently -- this is what stops two genuinely
     # different labels (e.g. AC Reference / Version#) from being merged just
@@ -1582,12 +2050,31 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
     # corresponding split on the left -- that is one row as printed, not two,
     # and counting every label globally conflated the two, overcounting by
     # exactly the number of such splits.
-    left_col_centers = sorted(y_center(l["span"]) for l in labeled if l["col"] == 0)
-    left_col_clusters = []
-    for c in left_col_centers:
-        if not left_col_clusters or c - left_col_clusters[-1] > row_tolerance_pt:
-            left_col_clusters.append(c)
-    row_count = len(left_col_clusters) or len(row_clusters)
+    # Counted from the DRAWN cells of that column where a grid was recovered:
+    # a merged cell is one rect however many labels sit beside it, so this needs
+    # no tolerance and cannot drift. Verified against both conventions -- Outer
+    # Carton's left column is 6 cells (12,6,6,12,6,6 mm) and Foil's is 5
+    # (12,6,6,6,6 mm), matching what each artwork prints.
+    row_count = None
+    row_heights_mm = None
+    if cells and col_bounds:
+        left_x0 = col_bounds[0][0]
+        left_cells = sorted(
+            (c for c in cells if abs(c[0] - left_x0) <= GRID_EPS_PT),
+            key=lambda c: c[1],
+        )
+        if left_cells:
+            row_count = len(left_cells)
+            row_heights_mm = [pt_to_mm(c[3] - c[1]) for c in left_cells]
+
+    if row_count is None:
+        # No grid -- fall back to clustering the left column's own labels.
+        left_col_centers = sorted(y_center(l["span"]) for l in labeled if l["col"] == 0)
+        left_col_clusters = []
+        for c in left_col_centers:
+            if not left_col_clusters or c - left_col_clusters[-1] > row_tolerance_pt:
+                left_col_clusters.append(c)
+        row_count = len(left_col_clusters) or len(row_clusters)
 
     pairs = []
     claimed_value_spans = set()
@@ -1606,12 +2093,23 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
         val_col = (col_bounds[value_col] if col_bounds and l["col"] >= 0 and value_col < len(col_bounds)
                    else None)
 
+        # The cell each side actually occupies, looked up from the drawn grid.
+        label_cell = _cell_containing(l["span"]["bbox"], cells)
+        value_cell = None
+        if value_spans:
+            value_text_bbox = [
+                min(s["bbox"][0] for s in value_spans), min(s["bbox"][1] for s in value_spans),
+                max(s["bbox"][2] for s in value_spans), max(s["bbox"][3] for s in value_spans),
+            ]
+            value_cell = _cell_containing(value_text_bbox, cells)
+
         pairs.append({
             "row": row_number_for(l["span"]),
             "col_pair": (l["col"] // 2) + 1 if l["col"] >= 0 else None,
             "canonical": l["canon"],
-            "label": _recon_describe_group([l["span"]], label_col, swatches),
-            "value": _recon_describe_group(value_spans, val_col, swatches) if value_spans else None,
+            "label": _recon_describe_group([l["span"]], label_cell, swatches, label_col),
+            "value": (_recon_describe_group(value_spans, value_cell, swatches, val_col)
+                      if value_spans else None),
         })
     pairs.sort(key=lambda p: (p["row"], p["col_pair"] or 0))
 
@@ -1626,20 +2124,32 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
     #   top_from_page_top_pt/mm      -- table's top border
     #   bottom_from_page_top_pt/mm   -- table's bottom border (also measured
     #                                    from the page's TOP edge)
-    all_x0 = [s["bbox"][0] for s in spans]
-    all_x1 = [s["bbox"][2] for s in spans]
-    all_y0 = [s["bbox"][1] for s in spans]
-    all_y1 = [s["bbox"][3] for s in spans]
-    table_bbox = [min(all_x0), min(all_y0), max(all_x1), max(all_y1)]
+    #
+    # Taken from the DRAWN border when the grid was recovered. Text extent is
+    # not the table: text sits inside its cell, so measuring the spans gave
+    # 176.96 x 47.06 for a header drawn at exactly 180.00 x 48.00 -- enough to
+    # fail a 180x48 spec on a page that is dimensionally perfect. The text
+    # extent is still reported separately as text_extent_bbox_mm, since a
+    # "content must stay inside the table" check needs both.
+    text_bbox = [
+        min(s["bbox"][0] for s in spans), min(s["bbox"][1] for s in spans),
+        max(s["bbox"][2] for s in spans), max(s["bbox"][3] for s in spans),
+    ]
+    has_span_mm = all(isinstance(s.get("bbox_mm"), list) for s in spans)
+    text_bbox_mm = ([
+        min(s["bbox_mm"][0] for s in spans), min(s["bbox_mm"][1] for s in spans),
+        max(s["bbox_mm"][2] for s in spans), max(s["bbox_mm"][3] for s in spans),
+    ] if has_span_mm else bbox_to_mm(text_bbox))
 
-    has_mm = all(isinstance(s.get("bbox_mm"), list) for s in spans)
-    table_bbox_mm = None
-    if has_mm:
-        mm_x0 = [s["bbox_mm"][0] for s in spans]
-        mm_x1 = [s["bbox_mm"][2] for s in spans]
-        mm_y0 = [s["bbox_mm"][1] for s in spans]
-        mm_y1 = [s["bbox_mm"][3] for s in spans]
-        table_bbox_mm = [min(mm_x0), min(mm_y0), max(mm_x1), max(mm_y1)]
+    if grid.get("table_bbox"):
+        table_bbox = list(grid["table_bbox"])
+        table_bbox_source = "drawn_border"
+        # Prefer the paths' own bbox_mm over converting the snapped points.
+        table_bbox_mm = grid.get("table_bbox_mm") or bbox_to_mm(table_bbox)
+    else:
+        table_bbox = list(text_bbox)
+        table_bbox_source = "text_extent"
+        table_bbox_mm = text_bbox_mm
 
     return {
         "page_name": page_meta.get("page_name"),
@@ -1648,6 +2158,10 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
         "unassigned_spans": unassigned,
         "table_bbox": table_bbox,
         "table_bbox_mm": table_bbox_mm,
+        # Which geometry the size above came from, so a consumer never has to
+        # guess whether a near-miss is a real defect or a measurement artefact.
+        "table_bbox_source": table_bbox_source,
+        "text_extent_bbox_mm": text_bbox_mm,
         "table_width_pt": table_bbox[2] - table_bbox[0],
         "table_height_pt": table_bbox[3] - table_bbox[1],
         "table_width_mm": (table_bbox_mm[2] - table_bbox_mm[0]) if table_bbox_mm else None,
@@ -1661,9 +2175,17 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
         "top_from_page_top_mm": table_bbox_mm[1] if table_bbox_mm else None,
         "bottom_from_page_top_mm": table_bbox_mm[3] if table_bbox_mm else None,
         "row_count": row_count,
+        # Left-column row heights, from the drawn cells -- makes a merged row
+        # visible as a taller cell instead of an unexplained low row_count.
+        "row_heights_mm": row_heights_mm,
         "column_count": len(col_bounds) if col_bounds else None,
         "col_pair_count": math.ceil(len(col_bounds) / 2) if col_bounds else None,
-        "border_stroke_pt": _recon_border_stroke_values(all_paths),
+        "border_stroke_pt": grid.get("border_stroke_pt") or _recon_border_stroke_values(all_paths),
+        # How the grid was drawn ("rects" per-cell, "lines" ruled, or None when
+        # neither was found) and every cell it yielded, so a downstream check can
+        # address a specific cell rather than re-deriving the grid.
+        "grid_convention": grid.get("convention"),
+        "cells_mm": [bbox_to_mm(c) for c in cells] if cells else None,
         # Passed through for downstream compliance checks that need the
         # page's own geometry (e.g. horizontal-centering) alongside the
         # header's own -- not re-derived here since it's already computed.
@@ -1676,6 +2198,260 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
         # match the header-derived value) are already computed by
         # synthesize_ac_reference; no reason to re-derive them here.
         "ac_reference_computed": page_meta.get("ac_reference_computed"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# ARTWORK RECONSTRUCTION (the printed component, below the header)
+# ═══════════════════════════════════════════════════════════════
+#
+# Same discipline as the header table: rebuild from drawn geometry, never from
+# where text happens to sit. That distinction matters more here than anywhere
+# else -- if the component's boundary were derived from its own text, a layout
+# shifted 5 mm off-centre would shift the reference frame with it and the defect
+# would measure as perfect. The boundary has to come from the dieline.
+#
+# The dieline IS present in these PDFs (no CDR or separate technical file
+# needed). On the Outer Carton it is nine stroked rectangles tiling edge to
+# edge -- front/back 72x32, top/bottom 72x20, side panels 20x32, tuck flaps
+# 4x32, pasting flap 72x4.4 -- matching the declared 72x20x32 exactly. On the
+# Foil it is the 70x30 strip plus a separate 70x30 blister carrying ten 8x8
+# cavities.
+#
+# Two filters are essential, both learned from getting it wrong first:
+#   1. Drop annotation-coloured paths. The blue dimension callouts ("72.00 mm")
+#      sit OUTSIDE the component and inflated the boundary to
+#      [31.99, 107.78, 157.32, 224.30] before they were excluded.
+#   2. Drop rects nested inside other rects. Panels tile edge to edge; content
+#      boxes (the composition table's rows, the storage box) nest inside a
+#      panel and are not panels themselves.
+
+ARTWORK_MIN_PANEL_MM = 3.0     # smaller than this is a tick, a swatch or a cavity
+ARTWORK_NEST_EPS_MM = 0.5      # containment slack, in mm
+
+
+def _mm_box(path: dict) -> Optional[list]:
+    b = path.get("bbox_mm")
+    return b if isinstance(b, list) and len(b) >= 4 else None
+
+
+def _mm_area(b: list) -> float:
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _contains_mm(outer: list, inner: list) -> bool:
+    """True when outer encloses inner and the two are not the same box."""
+    if outer is inner:
+        return False
+    e = ARTWORK_NEST_EPS_MM
+    same = all(abs(a - b) <= e for a, b in zip(outer, inner))
+    if same:
+        return False
+    return (outer[0] <= inner[0] + e and outer[1] <= inner[1] + e
+            and outer[2] >= inner[2] - e and outer[3] >= inner[3] - e)
+
+
+def _relative_position(box: list, page_w_mm, page_h_mm,
+                       artboard: Optional[list], component: Optional[list]) -> dict:
+    """Every edge distance a placement rule might ask for, explicitly named.
+
+    Three frames, because they answer different questions and only the last is
+    immune to a whole-layout shift:
+      page      -- where it sits on the sheet (sheet size is arbitrary, so this
+                   is for reference, not compliance)
+      artboard  -- against the text-derived artboard, kept for continuity with
+                   the existing AC-reference edge check
+      component -- against the DIELINE. This is the one a placement rule wants.
+    """
+    out = {}
+    if page_w_mm is not None and page_h_mm is not None:
+        out["page"] = {
+            "left_from_page_left_mm": round(box[0], 2),
+            "right_from_page_left_mm": round(box[2], 2),
+            "top_from_page_top_mm": round(box[1], 2),
+            "bottom_from_page_top_mm": round(box[3], 2),
+            "right_margin_mm": round(page_w_mm - box[2], 2),
+            "bottom_margin_mm": round(page_h_mm - box[3], 2),
+        }
+    if artboard:
+        out["artboard"] = {
+            "left_from_artboard_left_mm": round(box[0] - artboard[0], 2),
+            "right_from_artboard_right_mm": round(artboard[2] - box[2], 2),
+            "top_from_artboard_top_mm": round(box[1] - artboard[1], 2),
+            "bottom_from_artboard_bottom_mm": round(artboard[3] - box[3], 2),
+        }
+    if component:
+        cw, ch = component[2] - component[0], component[3] - component[1]
+        out["component"] = {
+            "left_from_component_left_mm": round(box[0] - component[0], 2),
+            "right_from_component_right_mm": round(component[2] - box[2], 2),
+            "top_from_component_top_mm": round(box[1] - component[1], 2),
+            "bottom_from_component_bottom_mm": round(component[3] - box[3], 2),
+            # Signed offset of this box's centre from the component's centre --
+            # what a "must be centred" rule reads directly.
+            "center_offset_x_mm": round(
+                ((box[0] + box[2]) / 2) - (component[0] + cw / 2), 2),
+            "center_offset_y_mm": round(
+                ((box[1] + box[3]) / 2) - (component[1] + ch / 2), 2),
+        }
+    return out
+
+
+def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
+                                 header_bottom_mm: Optional[float]) -> dict:
+    """Rebuild the printed component below the header from its drawn geometry."""
+    page_meta = page_meta or {}
+    page_w_mm = page_meta.get("page_width_mm")
+    page_h_mm = page_meta.get("page_height_mm")
+    artboard = page_meta.get("artboard_bounds_mm")
+
+    below = []
+    for p in (paths or []):
+        b = _mm_box(p)
+        if not b:
+            continue
+        if header_bottom_mm is not None and b[1] < header_bottom_mm:
+            continue
+        below.append(p)
+
+    # Callouts are excluded from the geometry but reported, so a dimension
+    # cross-check can still read them and nobody wonders where they went.
+    callouts, structural = [], []
+    for p in below:
+        stroke = p.get("stroke_color_hex") or p.get("fill_color_hex") or ""
+        (callouts if is_annotation_color(stroke) else structural).append(p)
+
+    # Every structural box, whatever its size -- the composition table's thinner
+    # rows (2.58-2.97 mm tall) are real elements and must stay reportable. Only
+    # PANEL candidacy needs a size floor, so the two lists are kept apart; an
+    # earlier version filtered both together and silently lost those rows.
+    structural_boxes = [_mm_box(p) for p in structural]
+    panel_candidates = [p for p in structural
+                        if (_mm_box(p)[2] - _mm_box(p)[0]) >= ARTWORK_MIN_PANEL_MM
+                        and (_mm_box(p)[3] - _mm_box(p)[1]) >= ARTWORK_MIN_PANEL_MM]
+
+    cand_mm = [_mm_box(p) for p in panel_candidates]
+    panel_paths = [p for p, b in zip(panel_candidates, cand_mm)
+                   if not any(_contains_mm(o, b) for o in cand_mm)]
+    panel_paths.sort(key=lambda p: (_mm_box(p)[1], _mm_box(p)[0]))
+
+    # Group panels into connected components. A carton's panels TILE -- they
+    # share edges, so they are one flat blank. A Foil sheet instead carries two
+    # disjoint drawings, the 70x30 strip and the 70x30 blister sitting 61 mm
+    # below it; unioning those produced a meaningless 71.58 x 91.48 "component"
+    # matching nothing in the header. Adjacency separates the two cases without
+    # needing to know the component type.
+    boxes_mm = [_mm_box(p) for p in panel_paths]
+
+    def touching(a: list, b: list) -> bool:
+        gap = ARTWORK_NEST_EPS_MM
+        return (a[0] - gap <= b[2] and b[0] - gap <= a[2]
+                and a[1] - gap <= b[3] and b[1] - gap <= a[3])
+
+    group_of = [None] * len(panel_paths)
+    groups = []
+    for i in range(len(panel_paths)):
+        if group_of[i] is not None:
+            continue
+        stack, members = [i], []
+        group_of[i] = len(groups)
+        while stack:
+            cur = stack.pop()
+            members.append(cur)
+            for j in range(len(panel_paths)):
+                if group_of[j] is None and touching(boxes_mm[cur], boxes_mm[j]):
+                    group_of[j] = group_of[i]
+                    stack.append(j)
+        groups.append(sorted(members))
+
+    group_bbox = []
+    for members in groups:
+        bs = [boxes_mm[m] for m in members]
+        group_bbox.append([min(b[0] for b in bs), min(b[1] for b in bs),
+                           max(b[2] for b in bs), max(b[3] for b in bs)])
+
+    def build_panel(idx: int) -> dict:
+        p, b = panel_paths[idx], boxes_mm[idx]
+        own_component = group_bbox[group_of[idx]]
+        inner = [o for o in structural_boxes if _contains_mm(b, o)]
+        spans_in = []
+        for s in (body_spans or []):
+            sb = s.get("bbox_mm")
+            if not isinstance(sb, list) or len(sb) < 4:
+                continue
+            cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+            if (b[0] <= cx <= b[2]) and (b[1] <= cy <= b[3]):
+                spans_in.append(s)
+        return {
+            "bbox_mm": [round(v, 2) for v in b],
+            "width_mm": round(b[2] - b[0], 2),
+            "height_mm": round(b[3] - b[1], 2),
+            "stroke_width_pt": p.get("stroke_width_pt"),
+            "fill_color_hex": p.get("fill_color_hex"),
+            # Measured against this panel's OWN component group, not a union of
+            # unrelated drawings.
+            "position": _relative_position(b, page_w_mm, page_h_mm, artboard, own_component),
+            "inner_box_count": len(inner),
+            "inner_boxes_mm": [[round(v, 2) for v in i] for i in inner] or None,
+            "text_span_count": len(spans_in),
+            # Text WITH its geometry, not bare strings. The alignment rules live
+            # inside a panel -- the batch-coding colons and the composition
+            # claims are both in Face 3 -- so a check reading this panel needs
+            # the anchors here rather than re-deriving which spans fall inside
+            # which panel from sections.body.
+            "text_elements": [{
+                "text": s.get("text"),
+                "bbox_mm": s.get("bbox_mm"),
+                "rotation_deg": s.get("rotation_deg"),
+                "font_name": s.get("font_name"),
+                "font_size_pt": s.get("font_size_pt"),
+                "is_bold": s.get("is_bold"),
+                "color_hex": s.get("color_hex"),
+                "alignment": s.get("alignment"),
+            } for s in spans_in] or None,
+        }
+
+    components = []
+    for gi, members in enumerate(groups):
+        cb = group_bbox[gi]
+        components.append({
+            "bbox_mm": [round(v, 2) for v in cb],
+            "width_mm": round(cb[2] - cb[0], 2),
+            "height_mm": round(cb[3] - cb[1], 2),
+            "panel_count": len(members),
+            "panels": [build_panel(m) for m in members],
+        })
+    components.sort(key=lambda c: (-(c["width_mm"] * c["height_mm"]), c["bbox_mm"][1]))
+
+    placed = [p["bbox_mm"] for c in components for p in c["panels"]]
+    unplaced = []
+    for s in (body_spans or []):
+        sb = s.get("bbox_mm")
+        if not isinstance(sb, list) or len(sb) < 4:
+            continue
+        cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
+        if not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in placed):
+            unplaced.append(s.get("text"))
+
+    primary = components[0] if components else None
+    return {
+        "page_name": page_meta.get("page_name"),
+        "page_number": page_meta.get("page_number"),
+        # Each connected group of dieline panels is one drawn component. The
+        # largest is reported as the primary one, but the list is authoritative:
+        # a Foil sheet legitimately has two (strip and blister).
+        "component_count": len(components),
+        "components": components,
+        "primary_component_bbox_mm": primary["bbox_mm"] if primary else None,
+        "primary_component_width_mm": primary["width_mm"] if primary else None,
+        "primary_component_height_mm": primary["height_mm"] if primary else None,
+        "boundary_source": "dieline_paths" if components else None,
+        "panel_count": sum(c["panel_count"] for c in components),
+        "callout_path_count": len(callouts),
+        "unplaced_texts": unplaced or None,
+        "page_width_mm": page_w_mm,
+        "page_height_mm": page_h_mm,
+        "artboard_bounds_mm": artboard,
     }
 
 
@@ -1839,6 +2615,10 @@ def extract_page_data(page: fitz.Page, page_index: int,
                        + sections.get("annotation_near_misses", [])),
             page_w_mm=pt_to_mm(width_pt), page_h_mm=pt_to_mm(height_pt),
         ),
+        # Machine-readable barcode values, decoded from the drawn bars. The
+        # printed caption is outlined vector, so this is the only way to read
+        # the graphic's own value -- see decode_barcodes for why not OCR.
+        "barcodes": decode_barcodes(raw_drawings),
         # Declared size vs printed callouts vs drawn geometry, reconciled once.
         "dimension_check": synthesize_dimension_check(
             sections["header_table"], sections["annotations"],
@@ -1957,17 +2737,32 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
         if "sections" in page_data:
             on_pack_position = (page_data.get("ac_reference") or {}).get("on_pack_position") or {}
             dims = page_data.get("page_dimensions") or {}
+            meta = {
+                "page_name": page_data.get("name"),
+                "page_number": page_index + 1,
+                "page_width_mm": dims.get("width_mm"),
+                "page_height_mm": dims.get("height_mm"),
+                "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
+                "ac_reference_computed": page_data.get("ac_reference"),
+            }
+            header = build_header_reconstruction(
+                page_data["sections"]["header_table"], page_data.get("paths", []), meta,
+            )
+            # Split the page at the header's own drawn bottom edge where we have
+            # it, so the artwork pass never sees the header's grid lines. The
+            # 20%-of-height fallback mirrors HEADER_FALLBACK_RATIO, which is what
+            # the span split itself used when content detection failed.
+            header_bottom_mm = None
+            if header.get("table_bbox_mm"):
+                header_bottom_mm = header["table_bbox_mm"][3]
+            elif dims.get("height_mm") is not None:
+                header_bottom_mm = dims["height_mm"] * HEADER_FALLBACK_RATIO
+
             reconstructed[config["key"]] = {
-                "header": build_header_reconstruction(
-                    page_data["sections"]["header_table"], page_data.get("paths", []),
-                    {
-                        "page_name": page_data.get("name"),
-                        "page_number": page_index + 1,
-                        "page_width_mm": dims.get("width_mm"),
-                        "page_height_mm": dims.get("height_mm"),
-                        "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
-                        "ac_reference_computed": page_data.get("ac_reference"),
-                    },
+                "header": header,
+                "artwork": build_artwork_reconstruction(
+                    page_data["sections"].get("body", []), page_data.get("paths", []),
+                    meta, header_bottom_mm,
                 ),
             }
 
