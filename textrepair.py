@@ -147,6 +147,20 @@ PRODUCTION_MARK_SHAPE = re.compile(r'^[A-Za-z][A-Za-z0-9 .:/\-]{2,28}$')
 
 # ─── Ligature repair ─────────────────────────────────────────
 KNOWN_CORRECTIONS = {
+    # \u2500\u2500 Non-"ti" ligatures \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # The generic U+FFFD rule in repair_text() assumes the dropped glyph was a
+    # "ti" ligature. That holds for most Spanish body copy (utilizar, activo,
+    # contiene) but is wrong wherever the missing glyph is "ft", "tt" or "fi".
+    # Left to the generic rule these came out as "cetiriaxona", "Botiom",
+    # "atiached" and "diticil" -- and the first is a DRUG NAME, appearing 33
+    # times across the sample. Listed here so they are corrected before the
+    # guess runs and are reported at "high" confidence rather than "guessed".
+    'ce\ufffdriaxona': 'ceftriaxona', 'Ce\ufffdriaxona': 'Ceftriaxona',
+    'ce\ufffdriaxone': 'ceftriaxone', 'Ce\ufffdriaxone': 'Ceftriaxone',
+    'Bo\ufffdom': 'Bottom', 'bo\ufffdom': 'bottom',
+    'a\ufffdached': 'attached', 'A\ufffdached': 'Attached',
+    'di\ufffdcil': 'dif\u00edcil', 'Di\ufffdcil': 'Dif\u00edcil',
+    # \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     'con\ufffdene': 'contiene', 'Con\ufffdene': 'Contiene',
     'pharmaceu\ufffdcals': 'pharmaceuticals', 'Pharmaceu\ufffdcals': 'Pharmaceuticals',
     'úl\ufffdmo': 'último', 'e\ufffdqueta': 'etiqueta',

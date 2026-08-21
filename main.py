@@ -6,8 +6,12 @@ Enhanced: zone detection, rotation, ligature repair, annotation filtering.
 
 import fitz  # PyMuPDF
 import re
+import os
 import math
 import io
+import asyncio
+import contextlib
+import unicodedata
 import base64
 import logging
 import time
@@ -121,6 +125,159 @@ OCR_DPI = 200                     # 200 DPI: ~20px glyphs on 6-7pt pharma print 
 OCR_SPAN_CAP = 15                 # >this many guessed spans on a page → skip OCR, flag page
 OCR_MAX_WORKERS = 4               # bounded parallel Tesseract calls (Render CPU is small)
 EXTRACTION_TIME_BUDGET_S = 120    # wall-clock guard: degrade gracefully, never 502
+
+# ─── Concurrency bound ───────────────────────────────────────
+# Heavy work runs via run_in_threadpool, whose default pool is 40 threads, so
+# without a bound 40 documents can be parsed simultaneously and peak memory is
+# whatever the traffic happens to be. On a 512 MB instance that is the one
+# failure mode worth engineering away: memory should be a property of the
+# CODE, not of the load.
+#
+# Measured peak RSS parsing the heaviest real artworks together (baseline
+# ~85 MB): 1 -> 95 MB, 2 -> 106, 4 -> 129, 8 -> 146, 16 -> 150. Per-request
+# cost falls as concurrency rises because the allocator reuses freed blocks,
+# so the curve flattens rather than climbing linearly. 4 keeps the extraction
+# side near ~130 MB while leaving room for upload buffers and JSON
+# serialisation of several concurrent responses.
+#
+# Excess requests WAIT rather than fail: a queued execution is slower, a
+# crashed instance takes every other execution down with it.
+EXTRACT_CONCURRENCY = int(os.getenv("EXTRACT_CONCURRENCY", "8"))
+_extract_slots: Optional[Any] = None   # (loop, asyncio.Semaphore)
+
+
+def _slots():
+    """Semaphore for the CURRENT event loop.
+
+    An asyncio.Semaphore binds to the loop that first awaits it and raises
+    "bound to a different event loop" anywhere else. Uvicorn serves on one loop
+    so a plain global would happen to work in production, but it breaks under
+    tests or any second loop -- and a concurrency guard that throws is worse
+    than none. Keyed by loop so it is correct either way.
+    """
+    global _extract_slots
+    loop = asyncio.get_running_loop()
+    if _extract_slots is None or _extract_slots[0] is not loop:
+        _extract_slots = (loop, asyncio.Semaphore(EXTRACT_CONCURRENCY))
+    return _extract_slots[1]
+
+
+# ─── Memory-aware admission ──────────────────────────────────
+# A fixed request count is a poor proxy for memory: four sticker labels cost
+# almost nothing, four 300-page inserts cost a lot. So the real gate is actual
+# memory use, read from the container's own cgroup accounting -- the same
+# number the OOM killer watches -- with the count above kept only as a backstop
+# against unbounded thread growth.
+#
+# Nothing needs configuring: the limit is discovered from cgroup at startup.
+# MEMORY_LIMIT_MB only exists as an override for environments that do not
+# expose cgroup files.
+MEMORY_HIGH_WATER = float(os.getenv("MEMORY_HIGH_WATER", "0.75"))  # admit below 75% of the limit
+MEMORY_WAIT_TIMEOUT_S = float(os.getenv("MEMORY_WAIT_TIMEOUT_S", "60"))
+MEMORY_POLL_S = 0.2
+
+_CGROUP_LIMIT_FILES = (
+    "/sys/fs/cgroup/memory.max",                      # cgroup v2
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",    # cgroup v1
+)
+_CGROUP_USAGE_FILES = (
+    "/sys/fs/cgroup/memory.current",                  # cgroup v2
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",    # cgroup v1
+)
+
+try:                     # optional: only used when cgroup files are absent
+    import psutil        # noqa: F401
+    _PROC = psutil.Process()
+except Exception:
+    _PROC = None
+
+
+def _read_int_file(paths) -> Optional[int]:
+    for path in paths:
+        try:
+            with open(path) as fh:
+                raw = fh.read().strip()
+            if raw == "max":
+                continue
+            value = int(raw)
+            # cgroup v1 reports a near-2^63 sentinel when memory is unlimited.
+            if 0 < value < (1 << 62):
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def _detect_memory_limit() -> Optional[int]:
+    override = os.getenv("MEMORY_LIMIT_MB")
+    if override:
+        try:
+            return int(float(override) * 1024 * 1024)
+        except ValueError:
+            logger.warning("Ignoring unparseable MEMORY_LIMIT_MB=%r", override)
+    return _read_int_file(_CGROUP_LIMIT_FILES)
+
+
+def _current_memory() -> Optional[int]:
+    """Bytes currently charged to this container, or this process as a fallback."""
+    usage = _read_int_file(_CGROUP_USAGE_FILES)
+    if usage is not None:
+        return usage
+    if _PROC is not None:
+        try:
+            return _PROC.memory_info().rss
+        except Exception:
+            return None
+    return None
+
+
+MEMORY_LIMIT_BYTES = _detect_memory_limit()
+_inflight = 0
+
+
+async def _wait_for_headroom() -> None:
+    """Hold a new extraction until memory drops below the high-water mark.
+
+    Deliberately never blocks the FIRST extraction: if a single document on its
+    own exceeds the mark there is nothing in flight to wait for, and refusing to
+    start would deadlock the service instead of merely slowing it. Same reason
+    for the timeout -- degrade to "run it anyway" rather than hang forever.
+    """
+    if MEMORY_LIMIT_BYTES is None:
+        return                      # cannot measure; the count cap is all we have
+    ceiling = MEMORY_LIMIT_BYTES * MEMORY_HIGH_WATER
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MEMORY_WAIT_TIMEOUT_S
+    waited = False
+    while True:
+        used = _current_memory()
+        if used is None or used < ceiling:
+            break
+        if _inflight == 0:
+            break                   # nothing to wait for -- see docstring
+        if loop.time() >= deadline:
+            logger.warning(
+                "Memory still at %.0f MB after waiting %.0fs; proceeding anyway",
+                used / 1048576, MEMORY_WAIT_TIMEOUT_S)
+            break
+        if not waited:
+            logger.info("Memory at %.0f MB of %.0f MB limit; queueing extraction",
+                        used / 1048576, MEMORY_LIMIT_BYTES / 1048576)
+            waited = True
+        await asyncio.sleep(MEMORY_POLL_S)
+
+
+@contextlib.asynccontextmanager
+async def _extraction_slot():
+    """Admit one extraction: count cap first, then memory headroom."""
+    global _inflight
+    async with _slots():
+        await _wait_for_headroom()
+        _inflight += 1
+        try:
+            yield
+        finally:
+            _inflight -= 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -903,6 +1060,12 @@ HEADER_FIELD_LABELS = {
     "size lxwxh": "dimension",
 }
 HEADER_MIN_LABELS = 2          # one stray phrase is not a header
+# Seed rows further apart than this belong to different clusters, and only one
+# of them is the header. An Insert's revision footer ("Version: AEMPS-Medaxone
+# 1 g-V2-Mar2025") matches the "version" alias 272 mm below the real header;
+# the largest gap WITHIN a real header is 12 mm, so 50 mm separates the two
+# cases with room to spare in both directions.
+HEADER_SEED_CLUSTER_GAP_PT = 50.0 / PT_TO_MM
 HEADER_FALLBACK_RATIO = 0.20   # top-of-page guess when content detection fails
 HEADER_PAD_PT = 6              # tolerance below the lowest header row
 HEADER_ROW_PITCH_TOLERANCE = 1.8   # a row this far past the normal pitch ends the table
@@ -1012,6 +1175,36 @@ def detect_header_region(page: fitz.Page, height_pt: float) -> dict:
         if hits:
             found_labels |= hits
             seed_idx.append(i)
+
+    # Keep only ONE cluster of seeds. _grow_header_band spans min(seed) to
+    # max(seed) before any gap check runs, so a single false seed in the body
+    # captures everything between: an Insert's revision footer matching
+    # "version" 272 mm down took AC2500 p4's header from 18 rows to 130, and no
+    # downstream filter can recover from a band that wrong.
+    if seed_idx:
+        clusters, current = [], [seed_idx[0]]
+        for prev, nxt in zip(seed_idx, seed_idx[1:]):
+            if rows[nxt]["bbox"][1] - rows[prev]["bbox"][1] > HEADER_SEED_CLUSTER_GAP_PT:
+                clusters.append(current)
+                current = []
+            current.append(nxt)
+        clusters.append(current)
+        if len(clusters) > 1:
+            # Most labels wins; ties go to the topmost, since SOP 2.1 puts the
+            # header at the top of the artboard.
+            def _label_count(cluster):
+                return len({canon for i in cluster
+                            for alias, canon in HEADER_FIELD_LABELS.items()
+                            if alias in _label_key(" ".join(rows[i]["words"]))})
+            best = max(clusters, key=lambda c: (_label_count(c), -rows[c[0]]["bbox"][1]))
+            dropped = sum(len(c) for c in clusters) - len(best)
+            logger.info("Header seeds formed %d clusters; kept %d rows, dropped %d "
+                        "stray label match(es) in body copy",
+                        len(clusters), len(best), dropped)
+            seed_idx = best
+            found_labels = {canon for i in seed_idx
+                            for alias, canon in HEADER_FIELD_LABELS.items()
+                            if alias in _label_key(" ".join(rows[i]["words"]))}
 
     if len(found_labels) < HEADER_MIN_LABELS or not seed_idx:
         return {
@@ -1686,8 +1879,13 @@ RECON_FIELD_LABELS = {
     "dimension": "dimension",
     "size in mm": "dimension",
     "size lxw": "dimension",
+    "size lxh": "dimension",
     "size lxwxh": "dimension",
     "size (w)": "dimension",
+    # Bare "Size" is safe as a last-resort alias: canonicalFor tries exact and
+    # word-boundary matches across every alias BEFORE falling back to substring,
+    # so "artwork size" and "flat size" are still claimed by their own entries.
+    "size": "dimension",
     "product code": "product_code",
     "style": "style",
     "barcode": "barcode",
@@ -1699,7 +1897,17 @@ RECON_FIELD_LABELS = {
 
 
 def _recon_label_key(text: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[.#:]", "", (text or "").lower())).strip()
+    """Normalise a header label for alias matching.
+
+    Parentheses must go, and become a SPACE rather than nothing: real headers
+    write the size field as "Size in mm (LxWxH)", "Size (LxW)", "Size (LxH)" or
+    bare "Size". Stripping only ".#:" left "size (lxw)", which matched no alias,
+    so the declared dimension was silently absent from every Label and Insert
+    header -- and on AC6241, where the label is just "Size", the value ran into
+    the neighbouring Style cell instead ("Top Open Bottom Paste 78x70x52 mm").
+    """
+    cleaned = re.sub(r"[.#:()\[\]]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _recon_canonical_for(text: Optional[str]) -> Optional[str]:
@@ -1724,6 +1932,11 @@ def _recon_area_of(b: list) -> float:
 # without merging genuinely distinct 6 pt rows.
 GRID_EPS_PT = 0.5
 GRID_MIN_LINE_PT = 5.0     # shorter than this is a tick or a swatch edge, not a rule
+# The drawn header border sits a little below the lowest glyph (carton: text to
+# 190.3 pt, border to 191.4 pt), so the band gets a small pad before the overlap
+# test decides what belongs to it.
+HEADER_BAND_PAD_PT = 20.0
+HEADER_BAND_MIN_OVERLAP = 0.8
 
 
 def _dedupe_edges(values: list, eps: float = GRID_EPS_PT) -> list:
@@ -1988,8 +2201,29 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
     # spans themselves, which the extractor already separated correctly) --
     # otherwise column detection picks up unrelated rects/lines from elsewhere
     # on the page and produces garbage boundaries.
+    # Keep a path only if MOST of it lies in the header band.
+    #
+    # Testing the top edge alone admitted an Insert's page border -- which
+    # begins just below the header text and then runs the whole sheet -- and the
+    # grid picked that 148x210 rect as its outer border, reporting AC3146's
+    # header as 180 x 152.96 mm instead of 180 x 30. But requiring strict
+    # containment overcorrected and dropped legitimate borders that sit a little
+    # below the lowest glyph, costing AC3146 p4 the correct 180 x 30 it already
+    # had. An overlap RATIO handles both without a magic distance: the page
+    # border overlaps the band by under 1% of its height, a real header rule by
+    # ~100%, whatever the page size.
     header_max_y = max(s["bbox"][3] for s in spans)
-    all_paths = [p for p in (paths or []) if p.get("bbox") and p["bbox"][1] < header_max_y + 10]
+    band_bottom = header_max_y + HEADER_BAND_PAD_PT
+
+    def _mostly_in_band(box: list) -> bool:
+        overlap = max(0.0, min(box[3], band_bottom) - box[1])
+        height = box[3] - box[1]
+        if height <= GRID_EPS_PT:      # a horizontal rule has no height to share
+            return box[1] <= band_bottom
+        return overlap / height >= HEADER_BAND_MIN_OVERLAP
+
+    all_paths = [p for p in (paths or [])
+                 if p.get("bbox") and _mostly_in_band(p["bbox"])]
     swatches = [p for p in all_paths if p.get("fill_color_hex")]
     grid = _header_grid(all_paths)
     col_bounds = _recon_column_bounds_from_grid(grid)
@@ -2164,8 +2398,10 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
         "text_extent_bbox_mm": text_bbox_mm,
         "table_width_pt": table_bbox[2] - table_bbox[0],
         "table_height_pt": table_bbox[3] - table_bbox[1],
-        "table_width_mm": (table_bbox_mm[2] - table_bbox_mm[0]) if table_bbox_mm else None,
-        "table_height_mm": (table_bbox_mm[3] - table_bbox_mm[1]) if table_bbox_mm else None,
+        # Rounded: subtracting two 2-dp millimetre values reintroduces binary
+        # float noise, so an exact 48 mm header printed as 47.99999999999999.
+        "table_width_mm": round(table_bbox_mm[2] - table_bbox_mm[0], 2) if table_bbox_mm else None,
+        "table_height_mm": round(table_bbox_mm[3] - table_bbox_mm[1], 2) if table_bbox_mm else None,
         "left_from_page_left_pt": table_bbox[0],
         "right_from_page_left_pt": table_bbox[2],
         "top_from_page_top_pt": table_bbox[1],
@@ -2228,6 +2464,11 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
 
 ARTWORK_MIN_PANEL_MM = 3.0     # smaller than this is a tick, a swatch or a cavity
 ARTWORK_NEST_EPS_MM = 0.5      # containment slack, in mm
+# A dimension callout is a rule or an arrowhead: degenerate in one axis, or
+# tiny. Measured on real artwork -- arrowheads are ~7.5 mm2, while the smallest
+# printed colour band is 691 mm2, so neither bound is delicate.
+ARTWORK_CALLOUT_MAX_THIN_MM = 0.5
+ARTWORK_CALLOUT_MAX_AREA_MM2 = 25.0
 
 
 def _mm_box(path: dict) -> Optional[list]:
@@ -2297,6 +2538,489 @@ def _relative_position(box: list, page_w_mm, page_h_mm,
     return out
 
 
+PANEL_ROW_EPS_MM = 2.0     # panels whose tops agree this closely share a row
+# A vertical whitespace channel at least this wide separates columns WITHIN a
+# panel. Measured on Face 3, whose real gutters are 2.49 mm and 8.34 mm while
+# the widest gap inside a column is under 1 mm -- so the threshold is not
+# delicate, but it is the number to revisit if a panel over- or under-splits.
+COLUMN_GUTTER_MM = 2.0
+
+
+def _split_panel_columns(text_elements: list, inner_boxes: list) -> list:
+    """Find content columns inside one panel, from vertical whitespace.
+
+    Projects everything the panel holds onto the x-axis, merges the occupied
+    bands, and treats any surviving gap as a column break.
+
+    Inner boxes are projected as well as text, and that is what makes the split
+    correct rather than merely plausible: Face 3's barcode is outlined vector
+    with no text layer at all, so a text-only projection finds two columns and
+    silently loses the barcode column entirely.
+    """
+    spans = [(e["bbox_mm"][0], e["bbox_mm"][2]) for e in (text_elements or [])
+             if isinstance(e.get("bbox_mm"), list)]
+    spans += [(b[0], b[2]) for b in (inner_boxes or [])]
+    if not spans:
+        return []
+
+    merged = []
+    for x0, x1 in sorted(spans):
+        if merged and x0 <= merged[-1][1] + COLUMN_GUTTER_MM:
+            merged[-1][1] = max(merged[-1][1], x1)
+        else:
+            merged.append([x0, x1])
+
+    columns = []
+    for i, (x0, x1) in enumerate(merged, start=1):
+        in_col = [e for e in (text_elements or [])
+                  if isinstance(e.get("bbox_mm"), list)
+                  and x0 - 0.01 <= (e["bbox_mm"][0] + e["bbox_mm"][2]) / 2 <= x1 + 0.01]
+        for e in in_col:
+            e["column"] = i
+        boxes = [b for b in (inner_boxes or [])
+                 if x0 - 0.01 <= (b[0] + b[2]) / 2 <= x1 + 0.01]
+        columns.append({
+            "column": i,
+            "x0_mm": round(x0, 2),
+            "x1_mm": round(x1, 2),
+            "width_mm": round(x1 - x0, 2),
+            "gutter_before_mm": (round(x0 - merged[i - 2][1], 2) if i > 1 else None),
+            "text_span_count": len(in_col),
+            "inner_box_count": len(boxes),
+        })
+    return columns
+
+
+def _address_panels(panels: list, component_bbox: list) -> None:
+    """Give every panel a grid address and its offset within its own component.
+
+    Addressed the way the header's cells are -- row/col a reviewer can point at
+    -- rather than by raw coordinates. Rows are banded on the top edge because
+    panels in a row are flush at the top but may differ in height (a 4mm tuck
+    flap sits beside a 32mm side panel).
+    """
+    tops = sorted({round(p["bbox_mm"][1], 1) for p in panels})
+    bands = []
+    for t in tops:
+        if not bands or t - bands[-1] > PANEL_ROW_EPS_MM:
+            bands.append(t)
+
+    for p in panels:
+        b = p["bbox_mm"]
+        row = min(range(len(bands)), key=lambda i: abs(bands[i] - b[1]))
+        p["grid_row"] = row + 1
+        p["offset_in_component_mm"] = {
+            "from_left_mm": round(b[0] - component_bbox[0], 2),
+            "from_top_mm": round(b[1] - component_bbox[1], 2),
+        }
+
+    for row in {p["grid_row"] for p in panels}:
+        same = sorted((p for p in panels if p["grid_row"] == row),
+                      key=lambda p: p["bbox_mm"][0])
+        for i, p in enumerate(same):
+            p["grid_col"] = i + 1
+
+    panels.sort(key=lambda p: (p["grid_row"], p["grid_col"]))
+
+
+def _infer_layout(panels: list, declared_mm: Optional[list]) -> dict:
+    """Work out what the drawn blank actually IS, from its own geometry.
+
+    A carton's four body faces wrap around the pack, so on the flat blank they
+    always form one contiguous run. The AXIS of that run fixes where the pack
+    opens, which is exactly what the Style field names:
+
+      run is vertical   -> fold lines horizontal -> closures left/right
+                           => "Side Open Side Open"
+      run is horizontal -> fold lines vertical   -> closures top/bottom
+                           => "Top Open Bottom Paste" / "Top Open Bottom Lock"
+
+    Verified against real artwork of both kinds: AC2491 (72x20x32) stacks two
+    72x32 faces vertically with 20x32 side panels and 4x32 tucks to left and
+    right; AC2676 (30x30x68) runs four 30x68 faces horizontally with the
+    closure flaps above. Derived independently of the header, so it can be
+    CHECKED against the Style cell rather than trusting it.
+
+    Paste vs Lock is not decidable from the blank outline alone -- both draw the
+    same rectangles -- so the derived value stays "Top Open Bottom *" and the
+    caller compares only the part geometry can support.
+    """
+    out = {"body_face_run_axis": None, "body_face_count": None,
+           "derived_style": None, "note": None}
+    if len(panels) < 3:
+        out["note"] = "too few panels to infer a carton layout"
+        return out
+
+    # Body faces are the largest panels; flaps and tucks are strictly smaller.
+    areas = [(p["width_mm"] * p["height_mm"], p) for p in panels]
+    biggest = max(a for a, _ in areas)
+    body = [p for a, p in areas if a >= biggest * 0.45]
+    if len(body) < 2:
+        out["note"] = "only one large panel; not a wrap-around blank"
+        return out
+
+    xs = {round(p["bbox_mm"][0], 1) for p in body}
+    ys = {round(p["bbox_mm"][1], 1) for p in body}
+    out["body_face_count"] = len(body)
+
+    if len(ys) > len(xs):
+        out["body_face_run_axis"] = "vertical"
+        out["derived_style"] = "Side Open Side Open"
+    elif len(xs) > len(ys):
+        out["body_face_run_axis"] = "horizontal"
+        out["derived_style"] = "Top Open Bottom *"
+    else:
+        out["note"] = "body faces do not form a clear run on either axis"
+        return out
+
+    if declared_mm and len(declared_mm) >= 3:
+        # Cross-check: every body face should measure L or W by H.
+        h = max(declared_mm)
+        matches = sum(1 for p in body
+                      if abs(max(p["width_mm"], p["height_mm"]) - h) <= 1.0)
+        out["body_faces_matching_declared_height"] = f"{matches}/{len(body)}"
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# LEGEND IDENTIFICATION (SOP section 3)
+# ═══════════════════════════════════════════════════════════════
+#
+# Names each block of copy on the artwork by matching it against the SOP's own
+# legend tables (3.1 common legends, 3.3 route of administration, 3.4 warnings).
+# This is IDENTIFICATION, not verification: it answers "which legend is this",
+# so a later compliance pass can ask "is its wording, placement and alignment
+# right". Matching is therefore deliberately lenient -- case- and accent-
+# insensitive, prefix-based -- because a block with a typo is still that legend,
+# and calling it unknown would hide the very defect worth reporting.
+
+BLOCK_GAP_MM = 2.5     # vertical gap that separates two blocks of copy
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", text)
+                   if unicodedata.category(c) != "Mn")
+
+
+def _legend_key(text: Optional[str]) -> str:
+    """Fold a block of copy down to something matchable."""
+    folded = _strip_accents((text or "").lower())
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9%/:.\s-]", " ", folded)).strip()
+
+
+# (legend_id, [phrases]) -- a block matches if it STARTS WITH any phrase, or for
+# the multi-line ones, contains it. Both language variants are listed because
+# the same artwork family ships in English and Spanish.
+LEGEND_PATTERNS = [
+    ("composition",           ["composicion:", "composition:", "composicion "]),
+    ("route_of_administration", ["via de administracion:", "route of administration:"]),
+    ("storage",               ["almacenamiento:", "storage:", "conservar en un lugar seco",
+                               "store in a dry place"]),
+    ("pediatric_warning",     ["producto medicinal, mantengase fuera",
+                               "medicinal product, keep out of reach"]),
+    ("additional_info",       ["para informacion adicional:", "for additional information:",
+                               "forma de preparacion:", "method of preparation:"]),
+    ("prescription_note",     ["venta bajo prescripcion medica",
+                               "sale under medical prescription"]),
+    ("otc_note",              ["producto de venta libre", "over-the-counter product"]),
+    ("hospital_use",          ["uso hospitalario", "for hospital use"]),
+    # Not keyed on "Código" alone: SOP 2.5 puts only Lot No. / Mfg. Date /
+    # Exp. Date in a Foil's stereo-print box, with no Código line at all, so a
+    # Código-only pattern missed the batch block on every Foil.
+    ("batch_coding",          ["codigo", "code ", "lote no", "lot no",
+                               "fecha fab", "mfg. date"]),
+    ("registration_numbers",  ["registro sanitario", "registration no"]),
+    ("manufacturer_address",  ["fabricado en la india por", "manufactured in india by"]),
+    ("route_short",           ["para uso oral", "para uso i.m", "para uso i.v",
+                               "para uso topico", "para uso oftalmico", "para uso otico",
+                               "para uso nasal", "para uso vaginal", "para uso rectal",
+                               "for oral use", "for im use", "for iv use", "for im/iv use",
+                               "for topical use", "for ophthalmic use"]),
+    ("stereo_print",          ["stereo print"]),
+    ("equivalence",           ["eq. a ", "eq. to "]),
+    ("reconstitution_note",   ["despues de reconstituido", "discard any remaining portion"]),
+    ("tube_closure_note",     ["mantenga el tubo bien cerrado", "keep the tube tightly closed"]),
+    ("external_use_note",     ["solo para uso externo", "for external use only"]),
+    ("shake_note",            ["agitese antes de usar", "shake before use"]),
+]
+
+# SOP 3.4 warnings are keyed by the excipient they name, since the body text
+# varies by substance but the leading term does not.
+WARNING_TERMS = [
+    "aspartame", "tartrazina", "tartrazine", "alcohol bencilico", "bencilic alcohol",
+    "benzyl alcohol", "tetraciclinas", "tetracyclines", "acido acetil salicilico",
+    "acetil salicilic acid", "acetaminofen", "acetaminophen", "gluten", "lactosa",
+    "lactose", "sodio", "sodium", "opio", "opium",
+]
+
+
+# Legends whose text is product-specific, so no fixed phrase can find them.
+# Keyed off structure instead, per SOP 1.4.1's construction formula
+# [API] [Rhydburg] [Strength] [Dosage Form].
+LEGEND_REGEXES = [
+    # "Rhydburg" not followed by the company suffix -- that is the address, and
+    # it is matched by its own leading phrase. The strength may be a percentage
+    # rather than a mass: topicals print "Rhydburg 0.1% + 0.1%", which a
+    # mass-only pattern missed on every Mono Carton and Tube.
+    ("trade_name", re.compile(
+        r"rhydburg(?!\s+(?:pharmaceuticals|llp))\s*[\d.]+\s*(?:mg|mcg|g|ml|iu|%)")),
+    ("ac_reference", re.compile(r"\bac\s*\d+\s*v\.?\s*\d+\b")),
+    # Countable forms ("30 Tabletas") and weight/volume presentations
+    # ("20 g", "10 ml") are both the unit of dosage form.
+    ("unit_of_dosage", re.compile(
+        r"^\d+\s*(?:tabletas|tablets|capsulas|capsules|viales|vials|sobres|"
+        r"sachets|ampollas|ampoules|comprimidos|g|kg)\b")),
+    ("container_volume", re.compile(r"^\d+\s*ml\b")),
+    # Route wording varies in gender and preposition across artworks
+    # ("Para uso tópico" / "tópica"), so match the construction, not a list.
+    ("route_short", re.compile(r"\bpara uso [a-z.]+|\bfor [a-z./]+ use\b")),
+    # Insert leaflets are prose, not legends. Their numbered section headings
+    # are still worth naming so the body of an insert is addressable.
+    ("insert_section", re.compile(r"^\d+\.\s+(?:que |como |posibles |contenido |conservacion)")),
+    ("shelf_life", re.compile(r"\bvida util\b|\bshelf life\b")),
+]
+
+
+def _identify_legends(text: str) -> list:
+    """Every SOP legend present in a block of copy, in the order they appear.
+
+    Returns a LIST because one block legitimately carries more than one legend:
+    on Face 1 the unit of dosage form and the route of administration sit
+    0.24 mm apart -- closer than lines within a single legend elsewhere -- so no
+    gap threshold can separate them, and reporting only the first would silently
+    drop the other.
+    """
+    key = _legend_key(text)
+    if not key:
+        return []
+
+    hits = []
+    for term in WARNING_TERMS:
+        for marker in (term + ":", term + " :"):
+            idx = key.find(marker)
+            if idx != -1:
+                hits.append((idx, f"warning_{term.replace(' ', '_')}"))
+                break
+    for legend_id, phrases in LEGEND_PATTERNS:
+        for phrase in phrases:
+            # Normalise the PATTERN the same way as the text. Written literally
+            # they drift apart: "producto medicinal, mantengase fuera" never
+            # matched, because the normaliser turns the comma into a space.
+            idx = key.find(_legend_key(phrase))
+            if idx != -1:
+                hits.append((idx, legend_id))
+                break
+    for legend_id, pattern in LEGEND_REGEXES:
+        m = pattern.search(key)
+        if m:
+            hits.append((m.start(), legend_id))
+
+    seen, ordered = set(), []
+    for _, legend_id in sorted(hits):
+        if legend_id not in seen:
+            seen.add(legend_id)
+            ordered.append(legend_id)
+    return ordered
+
+
+def _group_blocks(text_elements: list, inner_boxes: list) -> list:
+    """Group a panel's spans into blocks of copy.
+
+    Uses the drawn boxes where they exist and vertical gaps where they do not,
+    because that is how the artwork itself communicates grouping: Face 3's
+    left column boxes every legend individually (7 boxes, 7 legends), while its
+    middle column has none and relies on spacing -- ~1.3 mm between lines of one
+    block against 4.5-6.3 mm between blocks.
+    """
+    elements = [e for e in (text_elements or []) if isinstance(e.get("bbox_mm"), list)]
+    if not elements:
+        return []
+
+    blocks, claimed = [], set()
+    for box in sorted(inner_boxes or [], key=lambda b: (b[1], b[0])):
+        inside = [e for e in elements
+                  if id(e) not in claimed
+                  and box[0] - 0.5 <= (e["bbox_mm"][0] + e["bbox_mm"][2]) / 2 <= box[2] + 0.5
+                  and box[1] - 0.5 <= (e["bbox_mm"][1] + e["bbox_mm"][3]) / 2 <= box[3] + 0.5]
+        if inside:
+            for e in inside:
+                claimed.add(id(e))
+            blocks.append((inside, [round(v, 2) for v in box]))
+
+    loose = sorted((e for e in elements if id(e) not in claimed),
+                   key=lambda e: (e["bbox_mm"][1], e["bbox_mm"][0]))
+    run = []
+    for e in loose:
+        if run and e["bbox_mm"][1] - run[-1]["bbox_mm"][3] > BLOCK_GAP_MM:
+            blocks.append((run, None))
+            run = []
+        run.append(e)
+    if run:
+        blocks.append((run, None))
+
+    out = []
+    for members, box in blocks:
+        ordered = sorted(members, key=lambda e: (e["bbox_mm"][1], e["bbox_mm"][0]))
+        text = " ".join((e.get("text") or "").strip() for e in ordered).strip()
+        text = re.sub(r"\s+", " ", text)
+        bbox = [min(e["bbox_mm"][0] for e in ordered), min(e["bbox_mm"][1] for e in ordered),
+                max(e["bbox_mm"][2] for e in ordered), max(e["bbox_mm"][3] for e in ordered)]
+        legends = _identify_legends(text)
+        legend = legends[0] if legends else None
+        for e in ordered:
+            e["legend"] = legend
+        out.append({
+            "legend": legend,
+            "legends": legends or None,
+            "text": text,
+            "bbox_mm": [round(v, 2) for v in bbox],
+            "boxed": box is not None,
+            "box_mm": box,
+            "column": ordered[0].get("column"),
+            "span_count": len(ordered),
+        })
+    out.sort(key=lambda b: (b["bbox_mm"][1], b["bbox_mm"][0]))
+    return out
+
+
+DIM_LINE_EPS_MM = 0.6      # a rule is "at" a coordinate within this
+DIM_MATCH_TOL_MM = 0.5     # printed label vs measured geometry
+
+
+def _resolve_dimension_callouts(annotations: list, callouts: list,
+                                components: list,
+                                declared_regions: Optional[dict] = None) -> list:
+    """Pair each printed dimension label with the geometry it measures.
+
+    An engineering dimension is drawn as two extension lines BRACKETING the
+    label, joined by a rule with arrowheads. So the two extension lines nearest
+    the label -- one either side -- are what it measures, and the distance
+    between them is the true value. That makes the printed text checkable
+    against the drawing instead of merely reported: AC2491's "72.00 mm" sits
+    between extension lines at x=55.99 and x=127.99, which really are 72.00 mm
+    apart.
+
+    Also resolves WHAT is being measured by matching the bracketed span against
+    the panels and the blank, so a callout reads "panel 2.1 width" rather than
+    a bare pair of coordinates.
+    """
+    v_lines, h_lines = [], []
+    for p in callouts:
+        b = _mm_box(p)
+        if not b:
+            continue
+        w, h = b[2] - b[0], b[3] - b[1]
+        if w <= DIM_LINE_EPS_MM and h > DIM_LINE_EPS_MM:
+            v_lines.append(b)
+        elif h <= DIM_LINE_EPS_MM and w > DIM_LINE_EPS_MM:
+            h_lines.append(b)
+
+    def describe(span, axis):
+        """Name what a bracketed span corresponds to."""
+        lo, hi = span
+        length = hi - lo
+        for ci, comp in enumerate(components, start=1):
+            cb = comp["bbox_mm"]
+            c_lo, c_hi = (cb[0], cb[2]) if axis == "x" else (cb[1], cb[3])
+            if abs(lo - c_lo) <= DIM_MATCH_TOL_MM and abs(hi - c_hi) <= DIM_MATCH_TOL_MM:
+                return f"component {ci} full {'width' if axis == 'x' else 'height'}"
+            for panel in comp["panels"]:
+                pb = panel["bbox_mm"]
+                p_lo, p_hi = (pb[0], pb[2]) if axis == "x" else (pb[1], pb[3])
+                if abs(lo - p_lo) <= DIM_MATCH_TOL_MM and abs(hi - p_hi) <= DIM_MATCH_TOL_MM:
+                    return (f"panel {panel['grid_row']}.{panel['grid_col']} "
+                            f"{'width' if axis == 'x' else 'height'}")
+        # Not every dimension brackets a drawn edge. A Foil's Printing Zone and
+        # Repeat measure regions INSIDE the strip, so they match no panel -- but
+        # they are declared in the header, which names them exactly.
+        for field, value in (declared_regions or {}).items():
+            if value is not None and abs(length - value) <= DIM_MATCH_TOL_MM:
+                return f"declared {field.replace('_', ' ')}"
+        return f"unmatched span of {length:.2f} mm"
+
+    results = []
+    for ann in (annotations or []):
+        text = (ann.get("text") or "").strip()
+        box = ann.get("bbox_mm")
+        if not box or len(box) < 4:
+            continue
+        numbers = DIMENSION_NUMBER_RE.findall(text)
+        if not numbers:
+            continue
+        declared = float(numbers[0])
+        tw, th = box[2] - box[0], box[3] - box[1]
+
+        if th > tw:      # label set vertically -> it measures a height
+            axis, cx = "y", (box[1] + box[3]) / 2
+            rules = [ln for ln in h_lines
+                     if ln[0] - DIM_LINE_EPS_MM <= (box[0] + box[2]) / 2 <= ln[2] + DIM_LINE_EPS_MM]
+            coords = sorted({round(ln[1], 2) for ln in rules})
+        else:
+            axis, cx = "x", (box[0] + box[2]) / 2
+            rules = [ln for ln in v_lines
+                     if ln[1] - DIM_LINE_EPS_MM <= (box[1] + box[3]) / 2 <= ln[3] + DIM_LINE_EPS_MM]
+            coords = sorted({round(ln[0], 2) for ln in rules})
+
+        before = [c for c in coords if c <= cx]
+        after = [c for c in coords if c >= cx]
+        entry = {
+            "label": text,
+            "declared_mm": declared,
+            "orientation": "vertical" if axis == "y" else "horizontal",
+            "label_bbox_mm": [round(v, 2) for v in box],
+        }
+        if before and after:
+            lo, hi = max(before), min(after)
+            measured = round(hi - lo, 2)
+            entry.update({
+                "measured_mm": measured,
+                "span_mm": [lo, hi],
+                "matches_label": abs(measured - declared) <= DIM_MATCH_TOL_MM,
+                "measures": describe((lo, hi), axis),
+            })
+        else:
+            # Reported, not dropped: a callout whose extension lines cannot be
+            # found is a thing a reviewer should see, not a silent omission.
+            entry.update({"measured_mm": None, "span_mm": None,
+                          "matches_label": None,
+                          "measures": "extension lines not found"})
+        results.append(entry)
+
+    results.sort(key=lambda e: (e["orientation"], e["label_bbox_mm"][1]))
+    return results
+
+
+def _layout_with_style_check(layout: dict, declared_style: Optional[str]) -> dict:
+    """Compare the geometrically-derived layout against the header's Style cell.
+
+    Reported as three separate facts -- what the blank is drawn as, what the
+    header claims, and whether they agree -- so a disagreement points at which
+    side is wrong instead of collapsing to a bare pass/fail. Comparison is on
+    the opening axis only, since Paste vs Lock is not visible in the outline.
+    """
+    layout = dict(layout)
+    layout["declared_style"] = declared_style
+    derived = layout.get("derived_style")
+    if not derived or not declared_style:
+        layout["style_agrees"] = None
+        return layout
+
+    def axis_of(text: str) -> Optional[str]:
+        t = re.sub(r"[^a-z ]", " ", (text or "").lower())
+        if "side open" in t:
+            return "side"
+        if "top open" in t:
+            return "top"
+        return None
+
+    d_axis, h_axis = axis_of(derived), axis_of(declared_style)
+    layout["style_agrees"] = None if h_axis is None else (d_axis == h_axis)
+    if layout["style_agrees"] is False:
+        layout["note"] = (f"blank is drawn as {derived!r} but the header Style "
+                          f"cell says {declared_style!r}")
+    return layout
+
+
 def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
                                  header_bottom_mm: Optional[float]) -> dict:
     """Rebuild the printed component below the header from its drawn geometry."""
@@ -2310,16 +3034,38 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
         b = _mm_box(p)
         if not b:
             continue
-        if header_bottom_mm is not None and b[1] < header_bottom_mm:
+        # A path belongs to the header if it lies ENTIRELY within the header
+        # band. Testing the top edge alone (b[1] < bottom) left the header's own
+        # closing rule behind: it is a zero-height line sitting exactly ON the
+        # boundary, so it is not strictly above it and leaked into the artwork
+        # as a phantom 180mm element.
+        if (header_bottom_mm is not None
+                and b[3] <= header_bottom_mm + ARTWORK_NEST_EPS_MM):
             continue
         below.append(p)
 
     # Callouts are excluded from the geometry but reported, so a dimension
     # cross-check can still read them and nobody wonders where they went.
+    #
+    # Colour alone cannot decide this. ANNOTATION_COLORS was built for dimension
+    # TEXT and, at tolerance 24, the brand's Pantone Process Blue C fill
+    # (#008ccc) matches the annotation blue #0091d2 -- which filed the carton's
+    # blue band as a callout and removed the single element SOP 2.3.x's
+    # "70% white / 30% blue" rule depends on.
+    #
+    # Role separates them cleanly: a callout is a rule or an arrowhead, so it is
+    # either degenerate in one axis or tiny (arrowheads measure ~7.5 mm2). A
+    # printed colour band is a substantial filled area (the blue band is
+    # 691 mm2). Two orders of magnitude apart, so the threshold is not delicate.
     callouts, structural = [], []
     for p in below:
-        stroke = p.get("stroke_color_hex") or p.get("fill_color_hex") or ""
-        (callouts if is_annotation_color(stroke) else structural).append(p)
+        b = _mm_box(p)
+        w, h = b[2] - b[0], b[3] - b[1]
+        colour = p.get("stroke_color_hex") or p.get("fill_color_hex") or ""
+        is_marker = (min(w, h) < ARTWORK_CALLOUT_MAX_THIN_MM
+                     or (w * h) <= ARTWORK_CALLOUT_MAX_AREA_MM2)
+        (callouts if is_annotation_color(colour) and is_marker
+         else structural).append(p)
 
     # Every structural box, whatever its size -- the composition table's thinner
     # rows (2.58-2.97 mm tall) are real elements and must stay reportable. Only
@@ -2382,6 +3128,23 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
             cx, cy = (sb[0] + sb[2]) / 2, (sb[1] + sb[3]) / 2
             if (b[0] <= cx <= b[2]) and (b[1] <= cy <= b[3]):
                 spans_in.append(s)
+        inner_rounded = [[round(v, 2) for v in i] for i in inner]
+        text_elements = [{
+            "text": s.get("text"),
+            "bbox_mm": s.get("bbox_mm"),
+            "rotation_deg": s.get("rotation_deg"),
+            "font_name": s.get("font_name"),
+            "font_size_pt": s.get("font_size_pt"),
+            "is_bold": s.get("is_bold"),
+            "color_hex": s.get("color_hex"),
+            "alignment": s.get("alignment"),
+        } for s in spans_in]
+        # Tags each element with its column as a side effect, so an element
+        # carries its own address rather than the caller re-deriving it.
+        columns = _split_panel_columns(text_elements, inner_rounded)
+        # Tags each element with its legend as a side effect, same as columns.
+        blocks = _group_blocks(text_elements, inner_rounded)
+
         return {
             "bbox_mm": [round(v, 2) for v in b],
             "width_mm": round(b[2] - b[0], 2),
@@ -2392,34 +3155,48 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
             # unrelated drawings.
             "position": _relative_position(b, page_w_mm, page_h_mm, artboard, own_component),
             "inner_box_count": len(inner),
-            "inner_boxes_mm": [[round(v, 2) for v in i] for i in inner] or None,
+            "inner_boxes_mm": inner_rounded or None,
+            # Content columns within this panel, found from vertical whitespace.
+            # Face 3 splits into composition | batch-coding+registration |
+            # barcode; a single-content panel reports one column.
+            "column_count": len(columns),
+            "columns": columns or None,
+            # Blocks of copy, each named against the SOP's legend tables where
+            # it could be identified. This is what turns "column 2 holds 15
+            # spans" into "column 2 holds the batch-coding block and the
+            # registration numbers".
+            "block_count": len(blocks),
+            "blocks": blocks or None,
+            "unidentified_block_count": sum(1 for b in blocks if b["legend"] is None),
             "text_span_count": len(spans_in),
             # Text WITH its geometry, not bare strings. The alignment rules live
             # inside a panel -- the batch-coding colons and the composition
             # claims are both in Face 3 -- so a check reading this panel needs
             # the anchors here rather than re-deriving which spans fall inside
-            # which panel from sections.body.
-            "text_elements": [{
-                "text": s.get("text"),
-                "bbox_mm": s.get("bbox_mm"),
-                "rotation_deg": s.get("rotation_deg"),
-                "font_name": s.get("font_name"),
-                "font_size_pt": s.get("font_size_pt"),
-                "is_bold": s.get("is_bold"),
-                "color_hex": s.get("color_hex"),
-                "alignment": s.get("alignment"),
-            } for s in spans_in] or None,
+            # which panel from sections.body. Each element also carries its
+            # own "column".
+            "text_elements": text_elements or None,
         }
 
     components = []
     for gi, members in enumerate(groups):
         cb = group_bbox[gi]
+        panels = [build_panel(m) for m in members]
+        _address_panels(panels, cb)
         components.append({
             "bbox_mm": [round(v, 2) for v in cb],
             "width_mm": round(cb[2] - cb[0], 2),
             "height_mm": round(cb[3] - cb[1], 2),
+            # The whole component's own placement, in the same three frames the
+            # panels use -- "where does the artwork sit on the sheet" is a
+            # different question from "where does this face sit in the artwork",
+            # and both get asked.
+            "position": _relative_position(cb, page_w_mm, page_h_mm, artboard, None),
+            "layout": _layout_with_style_check(
+                _infer_layout(panels, page_meta.get("declared_dimensions_mm")),
+                page_meta.get("declared_style")),
             "panel_count": len(members),
-            "panels": [build_panel(m) for m in members],
+            "panels": panels,
         })
     components.sort(key=lambda c: (-(c["width_mm"] * c["height_mm"]), c["bbox_mm"][1]))
 
@@ -2448,11 +3225,49 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
         "boundary_source": "dieline_paths" if components else None,
         "panel_count": sum(c["panel_count"] for c in components),
         "callout_path_count": len(callouts),
+        # Each printed dimension label paired with the geometry it brackets,
+        # so the callout can be CHECKED against the drawing rather than just
+        # transcribed.
+        "dimension_callouts": _resolve_dimension_callouts(
+            page_meta.get("annotations"), callouts, components,
+            page_meta.get("declared_regions_mm")) or None,
         "unplaced_texts": unplaced or None,
         "page_width_mm": page_w_mm,
         "page_height_mm": page_h_mm,
         "artboard_bounds_mm": artboard,
     }
+
+
+def classify_page_kind(sections: dict, paths: list, has_header_grid: bool) -> str:
+    """What kind of page this is, so consumers can skip what does not apply.
+
+    Keyed on the presence of a DRAWN header table, because SOP 2.1 makes that
+    the defining feature: "Every artwork component must include a tabular
+    header". No table therefore means no component -- an illustration or an
+    engineering drawing.
+
+    An earlier version keyed on "carries no text at all", which happened to work
+    on the 10 ml vial sheets (0 text spans, 79 paths) but would have
+    misclassified any illustration that carried so much as a dimension label.
+    The grid test separates the real cases cleanly: the vial page recovers no
+    grid at all, while AC3146's insert pages recover 43 and 18 cells and are
+    genuinely components despite pairing badly.
+
+    The SOP has nothing to say about drawing pages -- its sections run header,
+    cartons, labels, foil, insert, legends, with no drawing section anywhere --
+    so they are labelled and deliberately left alone rather than measured
+    against rules that do not exist for them.
+    """
+    if has_header_grid:
+        return "component"
+    text_count = sum(len(sections.get(b) or []) for b in
+                     ("header_table", "body", "annotations",
+                      "annotation_near_misses", "production_marks"))
+    if not paths and not text_count:
+        return "blank"
+    # No tabular header: not a printed component. Distinguished only for
+    # reporting -- both are left alone.
+    return "technical_drawing" if text_count == 0 else "illustration"
 
 
 def extract_page_data(page: fitz.Page, page_index: int,
@@ -2595,6 +3410,12 @@ def extract_page_data(page: fitz.Page, page_index: int,
 
     return {
         "name": detected_name,
+        # "component" | "technical_drawing" | "unclassified" | "blank".
+        # A technical drawing is labelled and otherwise left alone: the SOP
+        # specifies nothing for it, so there is nothing to check it against.
+        # Provisional: set properly in extract_artwork once the header grid is
+        # known, since the drawn table is what decides this.
+        "page_kind": None,
         "sections": sections,
         "body_text": body_text,
         "body_text_all": body_text_all,
@@ -2744,10 +3565,30 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
                 "page_height_mm": dims.get("height_mm"),
                 "artboard_bounds_mm": on_pack_position.get("artboard_bounds_mm"),
                 "ac_reference_computed": page_data.get("ac_reference"),
+                # Dimension callouts are filed as annotations at extraction
+                # time; the artwork pass needs them to pair each label with the
+                # geometry it measures.
+                "annotations": page_data["sections"].get("annotations", []),
             }
             header = build_header_reconstruction(
                 page_data["sections"]["header_table"], page_data.get("paths", []), meta,
             )
+            # Feed the header's own declared Style and size into the artwork
+            # pass so the drawn blank can be CHECKED against them. The artwork
+            # side derives its layout from geometry alone and never reads these
+            # to decide anything -- otherwise the comparison would be circular.
+            hdr_fields = {p["canonical"]: (p["value"]["text"] if p.get("value") else None)
+                          for p in (header.get("pairs") or [])}
+            meta["declared_style"] = hdr_fields.get("style")
+            meta["declared_dimensions_mm"] = _dimension_numbers(hdr_fields.get("dimension")) or None
+            # Header-declared regions that are NOT panel edges (a Foil's
+            # Printing Zone and Repeat sit inside the strip), so a dimension
+            # callout over one of them can still be named rather than reported
+            # as an unmatched span.
+            meta["declared_regions_mm"] = {
+                field: (_dimension_numbers(hdr_fields.get(field)) or [None])[0]
+                for field in ("printing_zone", "repeat")
+            }
             # Split the page at the header's own drawn bottom edge where we have
             # it, so the artwork pass never sees the header's grid lines. The
             # 20%-of-height fallback mirrors HEADER_FALLBACK_RATIO, which is what
@@ -2757,6 +3598,12 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
                 header_bottom_mm = header["table_bbox_mm"][3]
             elif dims.get("height_mm") is not None:
                 header_bottom_mm = dims["height_mm"] * HEADER_FALLBACK_RATIO
+
+            # SOP 2.1 makes the drawn tabular header the mark of a component,
+            # so classification waits until the grid has been recovered.
+            page_data["page_kind"] = classify_page_kind(
+                page_data["sections"], page_data.get("paths", []),
+                bool(header.get("grid_convention")))
 
             reconstructed[config["key"]] = {
                 "header": header,
@@ -2841,10 +3688,14 @@ async def extract_pdf(file: UploadFile = File(...), render: bool = False,
         raise HTTPException(status_code=400, detail="render_dpi must be between 30 and 600")
     try:
         pdf_bytes = await file.read()
-        # Run in threadpool to avoid blocking the async event loop for large PDFs
-        result = await run_in_threadpool(
-            extract_artwork, pdf_bytes, file.filename, render, render_dpi
-        )
+        # Run in threadpool to avoid blocking the async event loop for large
+        # PDFs, but only EXTRACT_CONCURRENCY at a time so peak memory stays a
+        # property of the code rather than of the traffic.
+        async with _extraction_slot():
+            result = await run_in_threadpool(
+                extract_artwork, pdf_bytes, file.filename, render, render_dpi
+            )
+        del pdf_bytes
         # Explicit charset: some HTTP clients (n8n's HTTP Request node
         # included) don't honour RFC 8259's "JSON is always UTF-8" and
         # sniff/guess the response encoding when Content-Type omits it —
@@ -2881,7 +3732,11 @@ async def render_pages(file: UploadFile = File(...), dpi: int = 200):
         raise HTTPException(status_code=400, detail="dpi must be between 30 and 600")
     try:
         pdf_bytes = await file.read()
-        result = await run_in_threadpool(_render_all_pages, pdf_bytes, dpi)
+        # Rasterising is the heaviest thing here -- a 600 dpi A4 pixmap is a
+        # ~100 MB C-side buffer -- so it shares the same bound as /extract.
+        async with _extraction_slot():
+            result = await run_in_threadpool(_render_all_pages, pdf_bytes, dpi)
+        del pdf_bytes
         return JSONResponse(content=result)
     except HTTPException:
         raise
@@ -3037,12 +3892,75 @@ async def root():
     }
 
 
-@app.on_event("startup")
-async def startup_browser():
+# Chromium flags chosen for a small container: the default /dev/shm on Render is
+# 64 MB, and Chromium falls back to it for shared memory unless told otherwise,
+# which is a classic source of both crashes and inflated RSS.
+_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--no-first-run",
+]
+
+# Whether to keep Chromium resident between report requests. Off by default:
+# holding it costs 150-350 MB for the whole process life, and measured peak
+# under a 40-request extraction burst is already ~179 MB -- together those can
+# breach a 512 MB instance. Report generation happens once per review, so
+# paying ~1-2 s to relaunch is a far better trade than a crash that takes every
+# concurrent execution down with it. Set KEEP_BROWSER_WARM=1 if report latency
+# ever matters more than headroom.
+KEEP_BROWSER_WARM = os.getenv("KEEP_BROWSER_WARM", "0") == "1"
+
+_browser_lock = asyncio.Lock()
+
+
+async def _get_browser():
+    """Launch Chromium on first use, not at startup.
+
+    Measured: the extraction path holds ~93 MB steady with no leak across 45
+    consecutive documents, but Chromium adds 150-350 MB the moment it starts.
+    Launching it eagerly meant every instance paid that for the whole process
+    life even on runs that only ever called /extract -- which is what pushed a
+    512 MB instance over. Only /html-to-pdf needs a browser, so only
+    /html-to-pdf pays for one.
+    """
     global _playwright, _browser
+    if _browser is not None and _browser.is_connected():
+        return _browser
+    async with _browser_lock:
+        # Re-check inside the lock: concurrent first requests would otherwise
+        # each launch their own browser and leak all but the last.
+        if _browser is not None and _browser.is_connected():
+            return _browser
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+        logger.info("Launching headless Chromium (first /html-to-pdf request)")
+        _browser = await _playwright.chromium.launch(args=_CHROMIUM_ARGS)
+    return _browser
+
+
+async def _release_browser():
+    """Shut Chromium down and hand its memory back."""
+    global _browser
+    async with _browser_lock:
+        if _browser is None:
+            return
+        try:
+            await _browser.close()
+        except Exception:
+            logger.warning("Could not close Chromium cleanly")
+        finally:
+            _browser = None
+            logger.info("Released headless Chromium")
+
+
+@app.on_event("startup")
+async def startup_banner():
     log_ocr_status()
-    _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.launch(args=["--no-sandbox", "--disable-gpu"])
+    logger.info("Extraction concurrency limit: %d | keep browser warm: %s",
+                EXTRACT_CONCURRENCY, KEEP_BROWSER_WARM)
 
 
 @app.on_event("shutdown")
@@ -3050,26 +3968,33 @@ async def shutdown_browser():
     global _playwright, _browser
     if _browser:
         await _browser.close()
+        _browser = None
     if _playwright:
         await _playwright.stop()
+        _playwright = None
 
 
 @app.post("/html-to-pdf")
 async def html_to_pdf(request: Request):
     """Convert HTML body to PDF using headless Chromium."""
+    page = None
     try:
         data = await request.json()
         html_string = data.get("html", "")
         if not html_string:
             raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
-        page = await _browser.new_page()
-        await page.set_content(html_string, wait_until="networkidle")
+        browser = await _get_browser()
+        page = await browser.new_page()
+        # "networkidle" waits on external resources and times out on HTML that
+        # references anything unreachable. Combined with the un-guarded close
+        # below, every such timeout used to strand an open tab holding tens of
+        # MB -- a handful of failed report runs was enough to exhaust the box.
+        await page.set_content(html_string, wait_until="load")
         pdf_bytes = await page.pdf(
             format="A4",
             print_background=True,
             margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
         )
-        await page.close()
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
             media_type="application/pdf",
@@ -3079,3 +4004,12 @@ async def html_to_pdf(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+    finally:
+        # Must run on the failure paths too -- that is the whole point.
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                logger.warning("Could not close Chromium page after PDF generation")
+        if not KEEP_BROWSER_WARM:
+            await _release_browser()
