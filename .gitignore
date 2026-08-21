@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 
 CUsersparas_code_raw_utf8.txt
+CUsersparas_verify_splice.txt
+.mcp.json
