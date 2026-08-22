@@ -2284,22 +2284,34 @@ def build_header_reconstruction(header_spans: list, paths: list, page_meta: dict
     # corresponding split on the left -- that is one row as printed, not two,
     # and counting every label globally conflated the two, overcounting by
     # exactly the number of such splits.
-    # Counted from the DRAWN cells of that column where a grid was recovered:
-    # a merged cell is one rect however many labels sit beside it, so this needs
-    # no tolerance and cannot drift. Verified against both conventions -- Outer
-    # Carton's left column is 6 cells (12,6,6,12,6,6 mm) and Foil's is 5
-    # (12,6,6,6,6 mm), matching what each artwork prints.
+    # Counted from the DRAWN cells: a row boundary only counts if it spans the
+    # FULL table width. Where one side of a row splits into two while the other
+    # stays a single tall cell, that is one printed row, not two.
+    #
+    # Counting the left-hand column instead gives the same answer on every
+    # artwork seen so far -- the merge is always on the left (Carton at row 4,
+    # Insert/Foil/Label at row 1) -- but it silently assumes that, and would
+    # overcount a header that merged on the right. The full-width test does not
+    # care which side merges.
     row_count = None
     row_heights_mm = None
-    if cells and col_bounds:
-        left_x0 = col_bounds[0][0]
-        left_cells = sorted(
-            (c for c in cells if abs(c[0] - left_x0) <= GRID_EPS_PT),
-            key=lambda c: c[1],
-        )
-        if left_cells:
-            row_count = len(left_cells)
-            row_heights_mm = [pt_to_mm(c[3] - c[1]) for c in left_cells]
+    if cells and grid.get("table_bbox"):
+        tb = grid["table_bbox"]
+        span_needed = (tb[2] - tb[0]) - 2 * GRID_EPS_PT
+        by_top = {}
+        for c in cells:
+            by_top.setdefault(round(c[1], 1), []).append(c)
+
+        boundaries = []
+        for top, row_cells in sorted(by_top.items()):
+            covered = sum(c[2] - c[0] for c in row_cells)
+            if covered >= span_needed:
+                boundaries.append(min(c[1] for c in row_cells))
+        if boundaries:
+            edges = boundaries + [tb[3]]
+            row_count = len(boundaries)
+            row_heights_mm = [pt_to_mm(edges[i + 1] - edges[i])
+                              for i in range(len(boundaries))]
 
     if row_count is None:
         # No grid -- fall back to clustering the left column's own labels.
