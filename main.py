@@ -235,6 +235,30 @@ MEMORY_LIMIT_BYTES = _detect_memory_limit()
 _inflight = 0
 
 
+def _memory_snapshot() -> dict:
+    """Memory numbers for /health.
+
+    Free Render plans paywall the memory graph entirely and the paid one is
+    fixed at one sample per hour, which is far too coarse to catch a spike
+    inside a single report run. The workflow already pings /health to wake the
+    instance before every report, so reporting the cgroup counter -- the same
+    number the OOM killer watches -- gives one reading per run, captured in the
+    execution record, at no cost and on any plan.
+
+    Every field is Optional on purpose: cgroup files do not exist outside a
+    container, and this endpoint must never fail, because it is the wake-up
+    probe the whole workflow gates on. Missing numbers are reported as null,
+    never as an exception.
+    """
+    used = _current_memory()
+    limit = MEMORY_LIMIT_BYTES
+    return {
+        "memory_used_mb": round(used / 1048576, 1) if used is not None else None,
+        "memory_limit_mb": round(limit / 1048576, 1) if limit else None,
+        "memory_pct": round(100.0 * used / limit, 1) if used is not None and limit else None,
+    }
+
+
 async def _wait_for_headroom() -> None:
     """Hold a new extraction until memory drops below the high-water mark.
 
@@ -3882,6 +3906,13 @@ async def health_check():
         # Surfaced so a deployment can be checked without reading logs: "eng"
         # alone on Spanish artwork means the spa pack is missing (B-09).
         "ocr_languages": get_ocr_lang() if TESSERACT_AVAILABLE else None,
+        # Reports still rendering when this probe ran. The workflow wakes the
+        # instance before every report, so a non-zero value here is a direct
+        # record of runs overlapping -- which is what made the shared browser
+        # get closed out from under a render before _release_browser was
+        # refcounted.
+        "reports_in_flight": _browser_users,
+        **_memory_snapshot(),
     }
 
 
