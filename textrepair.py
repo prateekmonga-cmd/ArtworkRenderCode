@@ -182,6 +182,34 @@ KNOWN_CORRECTIONS = {
     'Prin\ufffdng Zone': 'Printing Zone',
     'Non Prin\ufffdng Area': 'Non Printing Area',
     'Pas\ufffdng Side': 'Pasting Side', 'pas\ufffdng side': 'pasting side',
+
+    # \u2500\u2500 Case-ambiguous word-initial ligatures \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # The guess below inserts LOWERCASE "ti", which is right for the prose that
+    # dominates ("tiene", "tipo", "tiempo") but wrong for a Title-Cased name.
+    # Nothing in the character stream reveals the case of a glyph that was
+    # dropped, so the phrases where it must be capitalised are named here.
+    # "Dioxido de Titanio" is the SOP's own colour name and is checked
+    # character-for-character by rule 1-32, which failed it as "titanio".
+    'de \ufffdtanio': 'de Titanio', 'De \ufffdtanio': 'De Titanio',
+    '\ufffdtanio': 'Titanio', '\ufffdtanio Di\u00f3xido': 'Titanio Di\u00f3xido',
+
+    # \u2500\u2500 "fi", not "ti" \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Decoded from context: "hemorroides, <?>stulas, fisuras anales" -- the
+    # neighbouring "fisuras" carries the same ligature, so the font drops "fi"
+    # here. Left to the ti-guess this became "tistulas".
+    '\ufffdstulas': 'f\u00edstulas', '\ufffdstula': 'f\u00edstula',
+    'F\ufffdstulas': 'F\u00edstulas',
+
+    # \u2500\u2500 Two ADJACENT sentinels \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # Insert body copy loses both "ti" pairs in "-titis" words. The generic
+    # rule deliberately refuses to touch adjacent sentinels (a blanket swap
+    # produced "Composicititin"), so each is named here instead. All appear in
+    # patient-facing side-effect lists, where a mangled condition name is worse
+    # than a visibly broken one.
+    'pancrea\ufffd\ufffds': 'pancreatitis', 'Pancrea\ufffd\ufffds': 'Pancreatitis',
+    'derma\ufffd\ufffds': 'dermatitis', 'Derma\ufffd\ufffds': 'Dermatitis',
+    'estoma\ufffd\ufffds': 'estomatitis', 'Estoma\ufffd\ufffds': 'Estomatitis',
+    'hepa\ufffd\ufffds': 'hepatitis', 'Hepa\ufffd\ufffds': 'Hepatitis',
 }
 
 
@@ -291,8 +319,21 @@ def repair_text(text: str) -> tuple:
     #    and sends a reviewer chasing a content mismatch instead of a corrupt
     #    extraction (B-06).
     if '\ufffd' in repaired:
+        # 2a. BETWEEN two letters -- the original case.
         single = re.sub(r'(?<=[^\W\d_])\ufffd(?=[^\W\d_])',
                         'ti', repaired)
+        # 2b. At the START of a word. "ti" is extremely common word-initially in
+        #     Spanish (tiene, tipo, tiempo, tinnitus, tiroides, titanio) and the
+        #     between-letters rule could never reach it: there is no letter to
+        #     the left, so a whole class of damage was left visible. Measured
+        #     across 15 artworks this accounted for every remaining U+FFFD --
+        #     20 distinct words, 19 of them "ti".
+        #
+        #     Still refuses to touch a sentinel that FOLLOWS another one, so
+        #     "pancrea<?><?>s" is not turned into "pancreatis"; those words are
+        #     named in KNOWN_CORRECTIONS and corrected before this runs.
+        single = re.sub(r'(?<![^\W\d_])(?<!\ufffd)\ufffd(?=[^\W\d_])',
+                        'ti', single)
         if single != repaired:
             repairs.append({"from": "U+FFFD", "to": "ti", "type": "ligature_ti",
                             "confidence": "guessed"})
