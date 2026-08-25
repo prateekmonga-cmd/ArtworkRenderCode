@@ -3147,7 +3147,12 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
             "rotation_deg": s.get("rotation_deg"),
             "font_name": s.get("font_name"),
             "font_size_pt": s.get("font_size_pt"),
+            # Unsnapped size as well: font_size_pt is snapped for grouping and
+            # display, so a 2.75 pt span reads as 3.0 and would silently satisfy
+            # a "minimum 3 pt" rule. Any minimum-size check must use this one.
+            "font_size_pt_raw": s.get("font_size_pt_raw"),
             "is_bold": s.get("is_bold"),
+            "is_italic": s.get("is_italic"),
             "color_hex": s.get("color_hex"),
             "alignment": s.get("alignment"),
         } for s in spans_in]
@@ -3925,7 +3930,27 @@ _CHROMIUM_ARGS = [
 # ever matters more than headroom.
 KEEP_BROWSER_WARM = os.getenv("KEEP_BROWSER_WARM", "0") == "1"
 
+# ─── Report rendering bound ──────────────────────────────────
+# Chromium is the most expensive thing this service can hold, so only
+# PDF_CONCURRENCY reports render at a time and the rest WAIT -- same trade as
+# EXTRACT_CONCURRENCY above. Default 1: report generation runs a few dozen
+# times a day and takes seconds, so serialising costs nothing while keeping
+# peak to one browser with one tab.
+PDF_CONCURRENCY = int(os.getenv("PDF_CONCURRENCY", "1"))
+_pdf_slots: Optional[Any] = None   # (loop, asyncio.Semaphore)
+
+
+def _pdf_slot():
+    """Report-rendering semaphore for the CURRENT event loop (see _slots)."""
+    global _pdf_slots
+    loop = asyncio.get_running_loop()
+    if _pdf_slots is None or _pdf_slots[0] is not loop:
+        _pdf_slots = (loop, asyncio.Semaphore(PDF_CONCURRENCY))
+    return _pdf_slots[1]
+
+
 _browser_lock = asyncio.Lock()
+_browser_users = 0   # in-flight /html-to-pdf requests holding _browser
 
 
 async def _get_browser():
@@ -3937,27 +3962,41 @@ async def _get_browser():
     life even on runs that only ever called /extract -- which is what pushed a
     512 MB instance over. Only /html-to-pdf needs a browser, so only
     /html-to-pdf pays for one.
+
+    Every successful call MUST be paired with exactly one _release_browser():
+    the browser is shared, so it is refcounted and torn down only once the last
+    in-flight report is finished with it.
     """
-    global _playwright, _browser
-    if _browser is not None and _browser.is_connected():
-        return _browser
+    global _playwright, _browser, _browser_users
     async with _browser_lock:
-        # Re-check inside the lock: concurrent first requests would otherwise
-        # each launch their own browser and leak all but the last.
-        if _browser is not None and _browser.is_connected():
-            return _browser
-        if _playwright is None:
-            _playwright = await async_playwright().start()
-        logger.info("Launching headless Chromium (first /html-to-pdf request)")
-        _browser = await _playwright.chromium.launch(args=_CHROMIUM_ARGS)
-    return _browser
+        # Everything runs under the lock, with no unlocked fast path. A fast
+        # path could hand back a browser that a finishing request is closing in
+        # _release_browser right now, and the caller's next new_page() would
+        # then die with "Target page, context or browser has been closed".
+        if _browser is None or not _browser.is_connected():
+            if _playwright is None:
+                _playwright = await async_playwright().start()
+            logger.info("Launching headless Chromium for /html-to-pdf")
+            _browser = await _playwright.chromium.launch(args=_CHROMIUM_ARGS)
+        _browser_users += 1
+        return _browser
 
 
 async def _release_browser():
-    """Shut Chromium down and hand its memory back."""
-    global _browser
+    """Drop one claim on Chromium; shut it down once nobody holds it.
+
+    The refcount is what makes concurrent reports safe. The browser is global,
+    so a request finishing its PDF used to close it out from under every other
+    request still rendering, which then failed at new_page() with "Target page,
+    context or browser has been closed". Overlapping runs are the norm here --
+    the schedule fires several a minute and each execution lasts minutes -- so
+    the LAST one out turns off the lights, not the first.
+    """
+    global _browser, _browser_users
     async with _browser_lock:
-        if _browser is None:
+        if _browser_users > 0:
+            _browser_users -= 1
+        if KEEP_BROWSER_WARM or _browser_users > 0 or _browser is None:
             return
         try:
             await _browser.close()
@@ -3971,16 +4010,18 @@ async def _release_browser():
 @app.on_event("startup")
 async def startup_banner():
     log_ocr_status()
-    logger.info("Extraction concurrency limit: %d | keep browser warm: %s",
-                EXTRACT_CONCURRENCY, KEEP_BROWSER_WARM)
+    logger.info("Extraction concurrency limit: %d | report concurrency limit: %d "
+                "| keep browser warm: %s",
+                EXTRACT_CONCURRENCY, PDF_CONCURRENCY, KEEP_BROWSER_WARM)
 
 
 @app.on_event("shutdown")
 async def shutdown_browser():
-    global _playwright, _browser
+    global _playwright, _browser, _browser_users
     if _browser:
         await _browser.close()
         _browser = None
+    _browser_users = 0
     if _playwright:
         await _playwright.stop()
         _playwright = None
@@ -3989,24 +4030,44 @@ async def shutdown_browser():
 @app.post("/html-to-pdf")
 async def html_to_pdf(request: Request):
     """Convert HTML body to PDF using headless Chromium."""
-    page = None
     try:
         data = await request.json()
         html_string = data.get("html", "")
         if not html_string:
             raise HTTPException(status_code=400, detail="Missing 'html' field in request body")
-        browser = await _get_browser()
-        page = await browser.new_page()
-        # "networkidle" waits on external resources and times out on HTML that
-        # references anything unreachable. Combined with the un-guarded close
-        # below, every such timeout used to strand an open tab holding tens of
-        # MB -- a handful of failed report runs was enough to exhaust the box.
-        await page.set_content(html_string, wait_until="load")
-        pdf_bytes = await page.pdf(
-            format="A4",
-            print_background=True,
-            margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
-        )
+        # The slot is held until BOTH the tab and the browser claim are handed
+        # back, so the next report starts from a clean at-most-one-tab state
+        # instead of overlapping this one's teardown.
+        async with _pdf_slot():
+            page = None
+            # Outside the try below on purpose: if the launch itself fails there
+            # is no claim to release, and releasing one would unbalance the
+            # refcount for whoever else is rendering.
+            browser = await _get_browser()
+            try:
+                page = await browser.new_page()
+                # "networkidle" waits on external resources and times out on HTML
+                # that references anything unreachable. Combined with the
+                # un-guarded close below, every such timeout used to strand an
+                # open tab holding tens of MB -- a handful of failed report runs
+                # was enough to exhaust the box.
+                await page.set_content(html_string, wait_until="load")
+                pdf_bytes = await page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
+                )
+            finally:
+                # Must run on the failure paths too -- that is the whole point.
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        logger.warning("Could not close Chromium page after PDF generation")
+                await _release_browser()
+        # Streaming happens after the slot is free: the bytes are already fully
+        # in memory, so holding the slot across the response would only make
+        # queued reports wait on the client's download.
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
             media_type="application/pdf",
@@ -4016,12 +4077,3 @@ async def html_to_pdf(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
-    finally:
-        # Must run on the failure paths too -- that is the whole point.
-        if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                logger.warning("Could not close Chromium page after PDF generation")
-        if not KEEP_BROWSER_WARM:
-            await _release_browser()
