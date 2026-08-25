@@ -589,8 +589,14 @@ def _char_segments(chars: list) -> list:
 
     def flush():
         if boxes:
+            # Repair here too. These segments are built straight from the raw
+            # per-character stream, so they bypassed the repair the span's own
+            # "text" field goes through -- leaving U+FFFD in every segment of
+            # every insert while the span above it read correctly. Words already
+            # in KNOWN_CORRECTIONS ("activo", "cantidad") were surviving intact
+            # in this one field, which is how it was found.
             segments.append({
-                "text": "".join(text_parts).strip(),
+                "text": repair_text("".join(text_parts).strip())[0],
                 "bbox_mm": bbox_to_mm((
                     min(b[0] for b in boxes), min(b[1] for b in boxes),
                     max(b[2] for b in boxes), max(b[3] for b in boxes),
