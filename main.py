@@ -3976,6 +3976,19 @@ KEEP_BROWSER_WARM = os.getenv("KEEP_BROWSER_WARM", "0") == "1"
 PDF_CONCURRENCY = int(os.getenv("PDF_CONCURRENCY", "1"))
 _pdf_slots: Optional[Any] = None   # (loop, asyncio.Semaphore)
 
+# How long a single report may take inside Chromium. Playwright's default is
+# 30 s, which is a bound on the MACHINE, not on the work: the same report that
+# lays out in ~2 s on a dev box exceeded 30 s on a throttled shared CPU and
+# failed with "Page.set_content: Timeout 30000ms exceeded" -- with nothing
+# external to fetch, so it was pure layout time. Report size grows with the
+# artwork, so this is set high enough that a slow instance finishes rather than
+# a large report being the thing that breaks.
+#
+# This is a backstop against a genuine hang, not a latency target: reports are
+# generated a few dozen times a day and PDF_CONCURRENCY=1 already serialises
+# them, so a long ceiling costs nothing when things are healthy.
+PDF_TIMEOUT_MS = int(os.getenv("PDF_TIMEOUT_MS", "180000"))
+
 
 def _pdf_slot():
     """Report-rendering semaphore for the CURRENT event loop (see _slots)."""
@@ -4088,11 +4101,28 @@ async def html_to_pdf(request: Request):
                 # un-guarded close below, every such timeout used to strand an
                 # open tab holding tens of MB -- a handful of failed report runs
                 # was enough to exhaust the box.
-                await page.set_content(html_string, wait_until="load")
+                #
+                # "domcontentloaded", not "load": the report embeds everything --
+                # measured on the real payload of exec 86874, zero <img>, zero
+                # <link>, zero @font-face, zero external URLs -- so there are no
+                # subresources for "load" to add, only a longer wait.
+                #
+                # The explicit timeout is the actual fix for that execution.
+                # Playwright defaults to 30 s and the call was left on the
+                # default, so a 290 KB report (731 rows, 75 tables) laying out on
+                # a throttled shared CPU died with "Timeout 30000ms exceeded"
+                # while doing nothing wrong. Layout time scales with the report,
+                # which grows with the artwork -- so the bound has to be one a
+                # big report can actually meet, not one that fits a small one.
+                await page.set_content(
+                    html_string, wait_until="domcontentloaded", timeout=PDF_TIMEOUT_MS)
                 pdf_bytes = await page.pdf(
                     format="A4",
                     print_background=True,
                     margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
+                    # Same reasoning: paginating those 75 tables is the other
+                    # place a slow CPU exceeds the 30 s default.
+                    timeout=PDF_TIMEOUT_MS,
                 )
             finally:
                 # Must run on the failure paths too -- that is the whole point.
