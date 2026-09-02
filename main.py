@@ -3311,7 +3311,14 @@ def build_artwork_reconstruction(body_spans: list, paths: list, page_meta: dict,
     }
 
 
-def classify_page_kind(sections: dict, paths: list, has_header_grid: bool) -> str:
+# A page with no text and no fonts needs enough drawn geometry to be a real
+# component rather than a stray rule or crop mark. The genuine drawing sheets
+# in the corpus sit at 79 paths; the outlined components at 172, 281 and 603.
+OUTLINED_TEXT_MIN_PATHS = int(os.getenv("OUTLINED_TEXT_MIN_PATHS", "120"))
+
+
+def classify_page_kind(sections: dict, paths: list, has_header_grid: bool,
+                       font_count: int = -1) -> str:
     """What kind of page this is, so consumers can skip what does not apply.
 
     Keyed on the presence of a DRAWN header table, because SOP 2.1 makes that
@@ -3338,6 +3345,19 @@ def classify_page_kind(sections: dict, paths: list, has_header_grid: bool) -> st
                       "annotation_near_misses", "production_marks"))
     if not paths and not text_count:
         return "blank"
+
+    # A page carrying NO text and NO fonts, yet plenty of drawn geometry, is not
+    # a drawing -- it is a component whose text was converted to outlines before
+    # the PDF was saved. The distinction matters enormously downstream:
+    # "technical_drawing" means no rule applies, while this means every rule
+    # applies and none of them could be read. Reporting the first for the second
+    # silently passed a Mono Carton and a Tube with zero checks (exec 87213).
+    #
+    # font_count is the discriminator, not the path count: a real dimension
+    # sheet still labels its dimensions, and those labels carry a font.
+    if text_count == 0 and font_count == 0 and len(paths) >= OUTLINED_TEXT_MIN_PATHS:
+        return "outlined_text"
+
     # No tabular header: not a printed component. Distinguished only for
     # reporting -- both are left alone.
     return "technical_drawing" if text_count == 0 else "illustration"
@@ -3530,6 +3550,13 @@ def extract_page_data(page: fitz.Page, page_index: int,
         },
         "paths": clean_paths,
         "images": images,
+        # Fonts declared in the page's own resources. A page cannot draw a glyph
+        # without a font unless that glyph has been converted to a path, so zero
+        # fonts on a page that still renders ink means the text is OUTLINED --
+        # see classify_page_kind(). Measured on Art-CommercialPDF-14635--v3:
+        # pages 1-3 have 0 fonts and 0 characters while rendering MORE ink than
+        # page 4, which has 2 fonts and reads normally.
+        "font_count": len(page.get_fonts()),
         "extraction_meta": {
             "text_repairs_applied": repair_count,
             "unresolved_corruption_count": unresolved_corruption_count,
@@ -3676,7 +3703,8 @@ def extract_artwork(pdf_bytes: bytes, filename: str = "", render: bool = False,
             # so classification waits until the grid has been recovered.
             page_data["page_kind"] = classify_page_kind(
                 page_data["sections"], page_data.get("paths", []),
-                bool(header.get("grid_convention")))
+                bool(header.get("grid_convention")),
+                page_data.get("font_count", -1))
 
             reconstructed[config["key"]] = {
                 "header": header,
