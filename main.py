@@ -11,6 +11,8 @@ import math
 import io
 import asyncio
 import contextlib
+import ctypes
+import gc
 import unicodedata
 import base64
 import logging
@@ -291,6 +293,26 @@ async def _wait_for_headroom() -> None:
         await asyncio.sleep(MEMORY_POLL_S)
 
 
+def _trim_heap() -> None:
+    """Return freed heap to the OS.
+
+    Python frees the objects an extraction allocated, but glibc keeps the arenas
+    and RSS never drops -- and RSS is what the cgroup counter and the OOM killer
+    watch. Measured on the live service: 309 MB resident with reports_in_flight
+    at 0 and nothing actually running, climbing to 400 MB (78% of a 512 MB cap)
+    across a single execution. Chromium then needs another 150-350 MB on top,
+    which is what kills the container mid-render and surfaces in n8n as
+    "the connection was aborted, perhaps the server is offline".
+
+    malloc_trim is glibc-only; anything else is a no-op, never an error.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 @contextlib.asynccontextmanager
 async def _extraction_slot():
     """Admit one extraction: count cap first, then memory headroom."""
@@ -302,6 +324,10 @@ async def _extraction_slot():
             yield
         finally:
             _inflight -= 1
+            # Give the memory back HERE rather than at the next admission: the
+            # thing most likely to run next is a report, and it launches
+            # Chromium without ever passing through this slot.
+            _trim_heap()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3989,6 +4015,12 @@ _pdf_slots: Optional[Any] = None   # (loop, asyncio.Semaphore)
 # them, so a long ceiling costs nothing when things are healthy.
 PDF_TIMEOUT_MS = int(os.getenv("PDF_TIMEOUT_MS", "180000"))
 
+# A report must clear a LOWER bar than an extraction, because what comes next is
+# a Chromium launch worth 150-350 MB, not another ~90 MB document. Admitting at
+# the extraction water mark (75%) leaves ~128 MB of a 512 MB cap for a browser
+# that needs multiples of that, which is precisely the OOM being fixed.
+RENDER_HIGH_WATER = float(os.getenv("RENDER_HIGH_WATER", "0.45"))
+
 
 def _pdf_slot():
     """Report-rendering semaphore for the CURRENT event loop (see _slots)."""
@@ -4032,6 +4064,47 @@ async def _get_browser():
         return _browser
 
 
+async def _wait_for_render_headroom() -> None:
+    """Hold a report until there is room to launch Chromium.
+
+    Deliberately NOT _wait_for_headroom(): that one returns immediately when
+    _inflight is 0, because for an extraction there would be nothing to wait
+    for. A report is the opposite case -- the memory in the way is usually left
+    over from extractions that have already finished, so _inflight is 0 and the
+    gate would wave it straight through into an OOM. Measured on the live
+    service at exactly that moment: 400 MB of a 512 MB cap, reports_in_flight 0.
+
+    So: trim first, and if that is not enough, wait and keep trimming. On
+    timeout it proceeds anyway -- the same trade as the extraction gate, since
+    refusing to render turns a slow report into a permanently broken one.
+    """
+    if MEMORY_LIMIT_BYTES is None:
+        return
+    _trim_heap()
+    ceiling = MEMORY_LIMIT_BYTES * RENDER_HIGH_WATER
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MEMORY_WAIT_TIMEOUT_S
+    waited = False
+    while True:
+        used = _current_memory()
+        if used is None or used < ceiling:
+            if waited:
+                logger.info("Memory down to %.0f MB; starting report render",
+                            (used or 0) / 1048576)
+            return
+        if loop.time() >= deadline:
+            logger.warning(
+                "Memory still at %.0f MB of %.0f MB after %.0fs; rendering anyway",
+                used / 1048576, MEMORY_LIMIT_BYTES / 1048576, MEMORY_WAIT_TIMEOUT_S)
+            return
+        if not waited:
+            logger.info("Memory at %.0f MB of %.0f MB limit; holding report render",
+                        used / 1048576, MEMORY_LIMIT_BYTES / 1048576)
+            waited = True
+        await asyncio.sleep(MEMORY_POLL_S)
+        _trim_heap()
+
+
 async def _release_browser():
     """Drop one claim on Chromium; shut it down once nobody holds it.
 
@@ -4042,7 +4115,7 @@ async def _release_browser():
     the schedule fires several a minute and each execution lasts minutes -- so
     the LAST one out turns off the lights, not the first.
     """
-    global _browser, _browser_users
+    global _playwright, _browser, _browser_users
     async with _browser_lock:
         if _browser_users > 0:
             _browser_users -= 1
@@ -4054,7 +4127,19 @@ async def _release_browser():
             logger.warning("Could not close Chromium cleanly")
         finally:
             _browser = None
-            logger.info("Released headless Chromium")
+        # Stop the driver too. async_playwright().start() spawns a Node process
+        # that outlives every browser it launches, so closing only the browser
+        # left it resident for the life of the container -- part of the ~309 MB
+        # measured with nothing in flight. _get_browser() restarts it on demand.
+        if _playwright is not None:
+            try:
+                await _playwright.stop()
+            except Exception:
+                logger.warning("Could not stop the Playwright driver cleanly")
+            finally:
+                _playwright = None
+        _trim_heap()
+        logger.info("Released headless Chromium and the Playwright driver")
 
 
 @app.on_event("startup")
@@ -4089,6 +4174,10 @@ async def html_to_pdf(request: Request):
         # back, so the next report starts from a clean at-most-one-tab state
         # instead of overlapping this one's teardown.
         async with _pdf_slot():
+            # Inside the slot, not outside: waiting for headroom while another
+            # report still holds Chromium would be waiting for memory that
+            # cannot be freed until that one finishes.
+            await _wait_for_render_headroom()
             page = None
             # Outside the try below on purpose: if the launch itself fails there
             # is no claim to release, and releasing one would unbalance the
