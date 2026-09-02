@@ -4096,6 +4096,13 @@ async def html_to_pdf(request: Request):
             browser = await _get_browser()
             try:
                 page = await browser.new_page()
+                # Covers every operation on this tab, including the internal
+                # protocol wait inside page.pdf(). That call takes NO timeout
+                # argument of its own -- passing one raises "Page.pdf() got an
+                # unexpected keyword argument 'timeout'" and fails the render
+                # outright (exec 87042), so the page default is the only way to
+                # bound it.
+                page.set_default_timeout(PDF_TIMEOUT_MS)
                 # "networkidle" waits on external resources and times out on HTML
                 # that references anything unreachable. Combined with the
                 # un-guarded close below, every such timeout used to strand an
@@ -4120,9 +4127,8 @@ async def html_to_pdf(request: Request):
                     format="A4",
                     print_background=True,
                     margin={"top": "15mm", "bottom": "15mm", "left": "10mm", "right": "10mm"},
-                    # Same reasoning: paginating those 75 tables is the other
-                    # place a slow CPU exceeds the 30 s default.
-                    timeout=PDF_TIMEOUT_MS,
+                    # No timeout= here: page.pdf() does not accept one. It is
+                    # bounded by set_default_timeout() above instead.
                 )
             finally:
                 # Must run on the failure paths too -- that is the whole point.
