@@ -274,6 +274,73 @@ def repair_mojibake(text: str) -> tuple:
     return MOJIBAKE_RUN.sub(fix, text), repairs
 
 
+# What each CID-derived codepoint really is. Every entry was read off the
+# corpus, not assumed -- the count and the word that proves it are recorded so
+# a future reader can re-check the claim instead of trusting it.
+LIGATURE_CIDS = {
+    "\u019f": ("ti", 1522, "con\u019fene -> contiene, \u019fempo -> tiempo"),
+    "\u014c": ("ft", 72, "ce\u014criaxona -> ceftriaxona, o\u014calm\u00f3logo -> oftalm\u00f3logo"),
+    "\u2070": ("\u00b0", 58, "30\u2070C -> 30\u00b0C"),
+    "\u019e": ("tf", 44, "me\u019eormina -> metformina"),
+    "\u01a1": ("t\u00ed", 28, "encefalopa\u01a1a -> encefalopat\u00eda, an\u01a1doto -> ant\u00eddoto"),
+    "\u0130": ("f\u00ed", 9, "di\u0130cil -> dif\u00edcil, radiogra\u0130a -> radiograf\u00eda"),
+    "\u01a9": ("tt", 5, "Bo\u01a9om -> Bottom"),
+    # Not a ligature but mis-mapped the same way: the insert's list bullet.
+    "\u0178": ("\u2022", 14, "\u0178Eczemas -> bullet + Eczemas"),
+    # A real narrow no-break space between a number and its unit (5 ml).
+    # Normalised so downstream comparisons, which all squash ordinary
+    # whitespace, do not trip over an exotic space character.
+    "\u202f": (" ", 2, "5\u202fml -> 5 ml, 10\u202fg/15\u202fml -> 10 g/15 ml"),
+    # Standard Unicode ligatures, decomposed for completeness. With the CID flag
+    # these usually arrive already decomposed, but a differently-built PDF may
+    # still emit them.
+    "\ufb00": ("ff", 0, "standard Unicode ligature"),
+    "\ufb01": ("fi", 0, "standard Unicode ligature"),
+    "\ufb02": ("fl", 0, "standard Unicode ligature"),
+    "\ufb03": ("ffi", 0, "standard Unicode ligature"),
+    "\ufb04": ("ffl", 0, "standard Unicode ligature"),
+}
+
+# Characters that are legitimately in this corpus and must NOT be "repaired":
+# Portuguese and Greek turn up in scientific text, and the maths symbols are
+# real. Listed explicitly so the unknown-codepoint detector below stays quiet
+# about them.
+EXPECTED_NON_ASCII = set(
+    "\u00c1\u00c9\u00cd\u00d3\u00da\u00dc\u00d1\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1"
+    "\u00bf\u00a1\u00ba\u00aa\u00b0\u00b1\u00ae\u00a9\u2018\u2019\u201c\u201d\u2013\u2014"
+    "\u2026\u00b7\u20ac\u00a0\u2022\u00e7\u00e3\u00e2\u00f5\u00f6\u00ab\u00bb"
+    "\u2264\u2265\u03b1\u03b2\u03b3\u00b5\u2122"
+)
+
+
+def decode_ligatures(text):
+    """Replace CID-derived ligature codepoints with the letters they stand for.
+
+    Deterministic: each codepoint identifies exactly one ligature, so nothing
+    is guessed. Returns (text, repairs, unknown) where `unknown` lists odd
+    codepoints that are NOT in the map -- those are reported rather than
+    guessed at, so a new font defect surfaces loudly instead of silently
+    becoming the wrong word.
+    """
+    if not text:
+        return text, [], []
+    repairs = []
+    out = text
+    for bad, (good, _count, _proof) in LIGATURE_CIDS.items():
+        if bad in out:
+            n = out.count(bad)
+            out = out.replace(bad, good)
+            repairs.append({"from": "U+%04X" % ord(bad), "to": good,
+                            "count": n, "type": "ligature_cid",
+                            "confidence": "high"})
+    unknown = []
+    for ch in set(out):
+        if ord(ch) < 0x80 or ch in EXPECTED_NON_ASCII:
+            continue
+        unknown.append("U+%04X" % ord(ch))
+    return out, repairs, sorted(unknown)
+
+
 def repair_text(text: str) -> tuple:
     """Repair mojibake and ligature corruption.
 
@@ -287,13 +354,25 @@ def repair_text(text: str) -> tuple:
                      word-edge). Nothing was invented: the sentinel is left in
                      place so the corruption stays visible downstream.
     """
+    # Ligatures first, and DETERMINISTICALLY. Each CID codepoint identifies
+    # exactly one ligature, so this is a lookup, not a guess -- unlike the
+    # U+FFFD path below, which cannot tell ti from fi and always assumed "ti".
+    # With TEXT_USE_CID_FOR_UNKNOWN_UNICODE set in main.py the extractor no
+    # longer produces U+FFFD at all, so that path is now a fallback for
+    # documents built some other way rather than the normal route.
+    text, lig_repairs, lig_unknown = decode_ligatures(text)
+
     has_ligature_damage = ('\ufffd' in text or '\xad' in text
                            or '\ufb01' in text or '\ufb02' in text)
     has_mojibake = bool(MOJIBAKE_RUN.search(text))
     if not has_ligature_damage and not has_mojibake:
+        # Ligature decoding on its own still counts as a repair, and it is a
+        # HIGH-confidence one: the codepoint named the ligature exactly.
+        if lig_repairs:
+            return text, True, lig_repairs, "high"
         return text, False, [], None
 
-    repairs = []
+    repairs = list(lig_repairs)
     repaired = text
     guessed = False
     failed = False
