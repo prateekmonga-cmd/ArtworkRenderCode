@@ -237,6 +237,23 @@ MEMORY_LIMIT_BYTES = _detect_memory_limit()
 _inflight = 0
 
 
+# ── Ligature recovery ───────────────────────────────────────────────────────
+#
+# These artworks embed subset Calibri whose ToUnicode CMap is wrong: every
+# ligature glyph is mapped to an unrelated codepoint. Read with the default
+# flags, MuPDF gives up on those glyphs and returns U+FFFD -- which collapses
+# ti, fi, fl, ft and tt onto ONE sentinel and throws away the only thing that
+# tells them apart. The repair layer then had no choice but to GUESS, and it
+# guessed "ti" every time: right on a carton (where the damage really is ti),
+# wrong on an insert, where fi and fl also occur.
+#
+# TEXT_USE_CID_FOR_UNKNOWN_UNICODE makes MuPDF fall back to the glyph's CID
+# instead of the sentinel, so each ligature arrives as its own codepoint and
+# can be decoded EXACTLY. Measured over all 21 artworks in the corpus:
+#   default flags : 1522 U+FFFD, every one of them guessed
+#   with this flag: 0 U+FFFD, every character identified
+TEXT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_USE_CID_FOR_UNKNOWN_UNICODE
+
 def _memory_snapshot() -> dict:
     """Memory numbers for /health.
 
@@ -748,7 +765,7 @@ def extract_text_spans_enhanced(page: fitz.Page, header_threshold: float) -> dic
     production_marks = []
     production_mark_near_misses = []
 
-    text_dict = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    text_dict = page.get_text("rawdict", flags=TEXT_FLAGS)
     body_spans_with_pos = []
 
     for block in text_dict.get("blocks", []):
@@ -3853,7 +3870,7 @@ async def render_pages(file: UploadFile = File(...), dpi: int = 200):
 
 def _extract_gpmi_page(page: fitz.Page) -> list:
     """Extract paragraphs from a single PDF page with <sup>/<sub> tags."""
-    text_dict = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    text_dict = page.get_text("rawdict", flags=TEXT_FLAGS)
     paragraphs = []
 
     for block in text_dict.get("blocks", []):
