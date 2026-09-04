@@ -252,7 +252,32 @@ _inflight = 0
 # can be decoded EXACTLY. Measured over all 21 artworks in the corpus:
 #   default flags : 1522 U+FFFD, every one of them guessed
 #   with this flag: 0 U+FFFD, every character identified
-TEXT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_USE_CID_FOR_UNKNOWN_UNICODE
+# The constant has been spelled two ways across PyMuPDF releases:
+# TEXT_CID_FOR_UNKNOWN_UNICODE (1.24.x) and TEXT_USE_CID_FOR_UNKNOWN_UNICODE
+# (1.26+, which also keeps the old name as an alias). Naming only the newer one
+# crashed this service on import against the pinned 1.24.9. Both are tried, then
+# the literal bit, so the extractor runs on any version.
+_CID_FLAG_BIT = 0x80
+_CID_FLAG_NAME = next(
+    (n for n in ("TEXT_USE_CID_FOR_UNKNOWN_UNICODE", "TEXT_CID_FOR_UNKNOWN_UNICODE")
+     if hasattr(fitz, n)), None)
+_CID_FLAG = getattr(fitz, _CID_FLAG_NAME) if _CID_FLAG_NAME else _CID_FLAG_BIT
+TEXT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | _CID_FLAG
+
+
+def cid_flag_status() -> dict:
+    """Whether the CID fallback is actually available, for /health and startup.
+
+    If a future PyMuPDF drops the flag the extractor would quietly go back to
+    U+FFFD and guessing, which is the failure this whole change exists to
+    remove -- so it is reported rather than left to be discovered in a report.
+    """
+    return {
+        "pymupdf_version": getattr(fitz, "VersionBind", "unknown"),
+        "cid_flag_name": _CID_FLAG_NAME or "(not exported; using literal 0x80)",
+        "cid_flag_value": _CID_FLAG,
+        "resolved_by_name": _CID_FLAG_NAME is not None,
+    }
 
 def _memory_snapshot() -> dict:
     """Memory numbers for /health.
@@ -3989,6 +4014,7 @@ async def health_check():
         # get closed out from under a render before _release_browser was
         # refcounted.
         "reports_in_flight": _browser_users,
+        "ligature_recovery": cid_flag_status(),
         **_memory_snapshot(),
     }
 
@@ -4193,6 +4219,16 @@ async def startup_banner():
     logger.info("Extraction concurrency limit: %d | report concurrency limit: %d "
                 "| keep browser warm: %s",
                 EXTRACT_CONCURRENCY, PDF_CONCURRENCY, KEEP_BROWSER_WARM)
+    st = cid_flag_status()
+    if st["resolved_by_name"]:
+        logger.info("Ligature recovery: %s = %d on PyMuPDF %s",
+                    st["cid_flag_name"], st["cid_flag_value"], st["pymupdf_version"])
+    else:
+        logger.warning(
+            "Ligature recovery: PyMuPDF %s exports neither TEXT_USE_CID_FOR_UNKNOWN_UNICODE "
+            "nor TEXT_CID_FOR_UNKNOWN_UNICODE; falling back to the literal bit 0x80. If "
+            "extraction still yields U+FFFD, this build does not support the flag.",
+            st["pymupdf_version"])
 
 
 @app.on_event("shutdown")
