@@ -1991,6 +1991,16 @@ RECON_FIELD_LABELS = {
     "repeat": "repeat",
     "printing zone": "printing_zone",
     "dia of tube": "dia_of_tube",
+    # Added 2026-09-15: the redesigned 7-row header introduced these two labels
+    # (Mono Carton/Foil row 7 "Presentation", Insert row 6 "Shelf life").
+    # Neither was in this table, so their spans fell to `plain` and had no
+    # label of their own to anchor a row window -- the value bled into
+    # whichever recognised label's window happened to span that row instead
+    # ("Presentation: Commercial" landing inside "Barcode", "Shelf life: 30
+    # month" landing inside the row below it). Recognising the label is what
+    # gives the row its own window; nothing else needed to change.
+    "presentation": "presentation",
+    "shelf life": "shelf_life",
 }
 
 
