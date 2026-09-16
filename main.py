@@ -1988,6 +1988,16 @@ RECON_FIELD_LABELS = {
     "style": "style",
     "barcode": "barcode",
     "printing overlay": "printing_overlay",
+    # "Repeat Outer" must resolve BEFORE the bare "repeat" entry, and to its
+    # OWN canonical: a two-track Foil header carries both "Repeat Outer"
+    # (52.5 mm here -- the strip/sheet height) and plain "Repeat" (35 mm --
+    # 2/3 of that height, the value SOP 2.5's own repeat rule checks) as two
+    # separate rows. With no entry of its own, "Repeat Outer" fell through to
+    # the substring match on "repeat" and shared its canonical, so
+    # auditFoil()'s declared("repeat") lookup (a plain .find()) picked
+    # whichever of the two rows came first and graded the wrong one -- 52.5 mm
+    # compared against the 2/3-of-height target of ~35 mm, always a mismatch.
+    "repeat outer": "repeat_outer",
     "repeat": "repeat",
     "printing zone": "printing_zone",
     "dia of tube": "dia_of_tube",
