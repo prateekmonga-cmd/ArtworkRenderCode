@@ -2953,6 +2953,102 @@ def _identify_legends(text: str) -> list:
     return ordered
 
 
+# ── Body tables ──────────────────────────────────────────────────────────
+#
+# A body table (e.g. a leaflet's own dosage-schedule table: infection type
+# <-> treatment duration) is drawn the same way the header table is -- an
+# outer rect, and either one rect per cell or a bare ruled grid of internal
+# lines (see _header_grid's own comment) -- it just sits in the page BODY,
+# never in scope for _header_grid's own caller, which only ever looks at
+# the header band. A plain single-paragraph legend box (Face 3's boxed
+# legends) has no internal divider at all; a table does. That is the only
+# signal needed to tell the two apart, and it is already available: a
+# block's own box_mm, from _group_blocks below, plus whichever OTHER
+# inner_boxes sit nested inside it.
+#
+# By the time inner_boxes reaches _group_blocks every drawn path has
+# already been stripped down to a bare bbox_mm list -- there is no
+# stroke_width_pt or fill_color_hex left to classify by, unlike
+# _header_grid's own paths input. Shape (thin in one axis vs both) is the
+# same signal _header_grid itself uses, just measured in mm instead of pt,
+# so the thresholds below are mm-native rather than back-converted from
+# GRID_EPS_PT/GRID_MIN_LINE_PT.
+BODY_TABLE_EPS_MM = 0.3
+BODY_TABLE_MIN_LINE_MM = 2.0
+
+
+def _body_table_grid(outer_box: list, nested_boxes: list) -> Optional[dict]:
+    """Recover a body table's row/column cell grid, mirroring _header_grid's
+    two conventions but working directly off millimetre boxes. Returns None
+    when the nested boxes do not resolve to a real >=2x2 grid -- a single
+    nested box (e.g. one inner rule shared with a neighbouring block) is not
+    enough to call this a table."""
+
+    def dedupe(values):
+        out = []
+        for v in sorted(values):
+            if not out or v - out[-1] > BODY_TABLE_EPS_MM:
+                out.append(v)
+        return out
+
+    rects = [b for b in nested_boxes
+             if (b[2] - b[0]) > BODY_TABLE_EPS_MM and (b[3] - b[1]) > BODY_TABLE_EPS_MM]
+    thin_h = [b for b in nested_boxes
+              if (b[3] - b[1]) <= BODY_TABLE_EPS_MM and (b[2] - b[0]) > BODY_TABLE_MIN_LINE_MM]
+    thin_v = [b for b in nested_boxes
+              if (b[2] - b[0]) <= BODY_TABLE_EPS_MM and (b[3] - b[1]) > BODY_TABLE_MIN_LINE_MM]
+
+    # Rects-per-cell convention: at least two genuine cell rects nested in
+    # the outer box (the outer box itself is never one of these -- it is
+    # the caller's own box, not a member of nested_boxes). Requires at
+    # least 2 real COLUMNS (>=3 column edges), not just multiple rows --
+    # what this exists to fix is a left-cell/right-cell garble, and a
+    # single-column, multi-row list (e.g. a composition list with internal
+    # rules between ingredients) is already read correctly by the plain
+    # y-then-x sort; confirmed on a real execution (product 12146) where a
+    # 1-column, 6-row composition block was otherwise misidentified as a
+    # table by row count alone.
+    if len(rects) >= 2:
+        col_edges = dedupe([r[0] for r in rects] + [r[2] for r in rects])
+        row_edges = dedupe([r[1] for r in rects] + [r[3] for r in rects])
+        if len(col_edges) >= 3 and len(row_edges) >= 2:
+            return {"cells": rects, "col_edges": col_edges, "row_edges": row_edges}
+        return None
+
+    # Bare ruled grid: internal rule lines imply the cells rather than
+    # drawing them. Requires at least one real vertical divider (>=3 column
+    # edges, i.e. >=2 columns) -- a box with only horizontal rules (e.g. a
+    # composition list with a rule between ingredients) is a single-column
+    # list, not a table, and the plain y-then-x sort already reads it
+    # correctly; confirmed on a real execution (product 12146) where a
+    # 1-column, 6-row composition block was otherwise misidentified as a
+    # table by row count alone.
+    if thin_v:
+        x0, y0, x1, y1 = outer_box
+        col_edges = dedupe([x0] + [v[0] for v in thin_v] + [x1])
+        row_edges = dedupe([y0] + [h[1] for h in thin_h] + [y1])
+        if len(col_edges) >= 3 and len(row_edges) >= 2:
+            cells = [[col_edges[ci], row_edges[ri], col_edges[ci + 1], row_edges[ri + 1]]
+                     for ci in range(len(col_edges) - 1)
+                     for ri in range(len(row_edges) - 1)]
+            return {"cells": cells, "col_edges": col_edges, "row_edges": row_edges}
+    return None
+
+
+def _row_index_for(y_center: float, row_edges: list) -> int:
+    """Which row band a span's own y-center falls closest to -- nearest
+    band, not strict containment, so a cell's text sitting a fraction of a
+    mm outside its own drawn row (baseline overhang) still lands in the
+    right row rather than falling through to the flat sort."""
+    mids = [(row_edges[i] + row_edges[i + 1]) / 2 for i in range(len(row_edges) - 1)]
+    return min(range(len(mids)), key=lambda i: abs(mids[i] - y_center))
+
+
+def _col_index_for(x_center: float, col_edges: list) -> int:
+    mids = [(col_edges[i] + col_edges[i + 1]) / 2 for i in range(len(col_edges) - 1)]
+    return min(range(len(mids)), key=lambda i: abs(mids[i] - x_center))
+
+
 def _group_blocks(text_elements: list, inner_boxes: list) -> list:
     """Group a panel's spans into blocks of copy.
 
@@ -2966,8 +3062,9 @@ def _group_blocks(text_elements: list, inner_boxes: list) -> list:
     if not elements:
         return []
 
+    all_boxes = list(inner_boxes or [])
     blocks, claimed = [], set()
-    for box in sorted(inner_boxes or [], key=lambda b: (b[1], b[0])):
+    for box in sorted(all_boxes, key=lambda b: (b[1], b[0])):
         inside = [e for e in elements
                   if id(e) not in claimed
                   and box[0] - 0.5 <= (e["bbox_mm"][0] + e["bbox_mm"][2]) / 2 <= box[2] + 0.5
@@ -2990,7 +3087,25 @@ def _group_blocks(text_elements: list, inner_boxes: list) -> list:
 
     out = []
     for members, box in blocks:
-        ordered = sorted(members, key=lambda e: (e["bbox_mm"][1], e["bbox_mm"][0]))
+        table = None
+        if box is not None:
+            # Other drawn boxes strictly nested inside this one -- internal
+            # dividers, not a coincidence of two unrelated boxes overlapping.
+            nested = [b for b in all_boxes if b != box and _contains_mm(box, b)]
+            if nested:
+                table = _body_table_grid(box, nested)
+
+        if table:
+            def cell_key(e, _t=table):
+                cy = (e["bbox_mm"][1] + e["bbox_mm"][3]) / 2
+                cx = (e["bbox_mm"][0] + e["bbox_mm"][2]) / 2
+                row = _row_index_for(cy, _t["row_edges"])
+                col = _col_index_for(cx, _t["col_edges"])
+                return (row, col, e["bbox_mm"][1], e["bbox_mm"][0])
+            ordered = sorted(members, key=cell_key)
+        else:
+            ordered = sorted(members, key=lambda e: (e["bbox_mm"][1], e["bbox_mm"][0]))
+
         text = " ".join((e.get("text") or "").strip() for e in ordered).strip()
         text = re.sub(r"\s+", " ", text)
         bbox = [min(e["bbox_mm"][0] for e in ordered), min(e["bbox_mm"][1] for e in ordered),
@@ -3008,6 +3123,9 @@ def _group_blocks(text_elements: list, inner_boxes: list) -> list:
             "box_mm": box,
             "column": ordered[0].get("column"),
             "span_count": len(ordered),
+            "is_table": bool(table),
+            "table_rows": (len(table["row_edges"]) - 1) if table else None,
+            "table_cols": (len(table["col_edges"]) - 1) if table else None,
         })
     out.sort(key=lambda b: (b["bbox_mm"][1], b["bbox_mm"][0]))
     return out
@@ -3100,7 +3218,27 @@ def _resolve_dimension_callouts(annotations: list, callouts: list,
             "label_bbox_mm": [round(v, 2) for v in box],
         }
         if before and after:
-            lo, hi = max(before), min(after)
+            # Among the eligible bracketing pairs, prefer the one whose span
+            # is closest to what THIS label itself declares, not simply the
+            # innermost (geometrically nearest) pair. A nested dimension --
+            # a Foil's Printing Zone arrow drawn just inside its full-width
+            # arrow -- puts the inner arrow's own extension lines within the
+            # same y-band eligibility as the outer label's text (they are
+            # only ~2-3 mm apart), so "nearest to the label" resolves the
+            # OUTER label to the INNER span. Confirmed on a real execution
+            # (Azithromycin 16383, Foil): the printed "158.00 mm" full-width
+            # label resolved to the same 148 mm span as the printing zone's
+            # own "148.00 mm" label -- while component 1's actual bbox width
+            # is exactly 158.00 mm, proving the correct, wider bracket pair
+            # was available and simply not the closest one to the label.
+            candidates = [
+                (abs((hi - lo) - declared), lo, hi)
+                for lo in before for hi in after if hi > lo
+            ]
+            if candidates:
+                _, lo, hi = min(candidates, key=lambda c: c[0])
+            else:
+                lo, hi = max(before), min(after)
             measured = round(hi - lo, 2)
             entry.update({
                 "measured_mm": measured,
